@@ -1,8 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
   SLOPE_BANDS,
-  renderSlopeOverlay, removeSlopeOverlay,
+  renderSlopeOverlay, removeSlopeOverlay, updateSlopeOpacity,
+  renderTopoOverlay,  removeTopoOverlay,  updateTopoOpacity,
   fetchPowerInfrastructure, renderPowerOverlay, removePowerOverlay,
+  clearTerrainCache,
   type InfraFeature,
 } from "./lib/overlays";
 
@@ -12,288 +14,284 @@ const T = {
   green:"#00875a", greenLt:"#e3f5ef",
   warn:"#7d5a00", warnLt:"#fef9e6", warnBd:"#e8c84a",
   red:"#c24b2a", redLt:"#fff0ed", redBd:"#f0a090",
+  brown:"#8B5E3C",
 };
 
 const IS_IN_FORMA = window.location.search.includes("origin=");
-
 type OverlayState = "off" | "loading" | "on" | "error";
+type InfraLayer = { substations:boolean; plants:boolean; lines:boolean };
 
-type InfraLayer = {
-  substations: boolean;
-  plants:      boolean;
-  lines:       boolean;
-};
 
 export default function OverlaysApp() {
-  const [slopeState,  setSlopeState]  = useState<OverlayState>("off");
-  const [slopeMsg,    setSlopeMsg]    = useState("");
-  const [powerState,  setPowerState]  = useState<OverlayState>("off");
-  const [powerMsg,    setPowerMsg]    = useState("");
-  const [infraLayers, setInfraLayers] = useState<InfraLayer>({ substations: true, plants: true, lines: true });
-  const [infraCache,  setInfraCache]  = useState<InfraFeature[] | null>(null);
-  const [infraStats,  setInfraStats]  = useState<{subs:number;plants:number;lines:number}|null>(null);
-  const [refLatLon,   setRefLatLon]   = useState<[number,number]|null>(null);
-  const [radiusMi,    setRadiusMi]    = useState(25);
+  const [slopeState,   setSlopeState]   = useState<OverlayState>("off");
+  const [slopeMsg,     setSlopeMsg]     = useState("");
+  const [slopeOpacity, setSlopeOpacity] = useState(0.80);
+  const [topoState,    setTopoState]    = useState<OverlayState>("off");
+  const [topoMsg,      setTopoMsg]      = useState("");
+  const [topoOpacity,  setTopoOpacity]  = useState(0.55);
+  const [powerState,   setPowerState]   = useState<OverlayState>("off");
+  const [powerMsg,     setPowerMsg]     = useState("");
+  const [infraLayers,  setInfraLayers]  = useState<InfraLayer>({substations:true,plants:true,lines:true});
+  const [infraCache,   setInfraCache]   = useState<InfraFeature[]|null>(null);
+  const [infraStats,   setInfraStats]   = useState<{subs:number;plants:number;lines:number}|null>(null);
+  const [refLatLon,    setRefLatLon]    = useState<[number,number]|null>(null);
+  const [radiusMi,     setRadiusMi]     = useState(25);
 
-  // Get project lat/lon on load
   useEffect(() => {
-    if (!IS_IN_FORMA) {
-      setRefLatLon([35.732, -78.823]); // dev mock
-      return;
-    }
+    if (!IS_IN_FORMA) { setRefLatLon([35.732, -78.823]); return; }
     (async () => {
       try {
         const { Forma } = await import("forma-embedded-view-sdk/auto");
         const geo = await Forma.project.getGeoLocation();
         if (geo) setRefLatLon([geo[0], geo[1]]);
-      } catch { /* non-fatal */ }
+      } catch { /* ok */ }
     })();
   }, []);
 
-  // ── Slope overlay ────────────────────────────────────────────────────────
+  // ── Slope ─────────────────────────────────────────────────────────────────
   const toggleSlope = useCallback(async () => {
     if (slopeState === "loading") return;
-
     if (slopeState === "on") {
-      await removeSlopeOverlay();
-      setSlopeState("off");
-      setSlopeMsg("");
-      return;
+      await removeSlopeOverlay().catch(()=>{});
+      setSlopeState("off"); setSlopeMsg(""); return;
     }
-
-    setSlopeState("loading");
-    setSlopeMsg("Starting…");
+    setSlopeState("loading"); setSlopeMsg("Starting…");
     try {
       if (!IS_IN_FORMA) {
-        // Dev mode simulation
-        await new Promise(r => setTimeout(r, 1200));
-        setSlopeState("on");
-        setSlopeMsg("Slope overlay applied (dev mode)");
-        return;
+        await new Promise(r=>setTimeout(r,600));
+        setSlopeState("on"); setSlopeMsg(""); return;
       }
-      await renderSlopeOverlay(msg => {
-        if (msg === "done") { setSlopeState("on"); setSlopeMsg(""); }
+      await renderSlopeOverlay(msg=>{
+        if (msg==="done"){setSlopeState("on");setSlopeMsg("");}
         else setSlopeMsg(msg);
-      });
-    } catch (e) {
-      setSlopeState("error");
-      setSlopeMsg(String(e));
+      }, slopeOpacity);
+    } catch(e) {
+      setSlopeState("error"); setSlopeMsg(String(e).substring(0,140));
     }
-  }, [slopeState]);
+  }, [slopeState, slopeOpacity]);
 
-  // ── Power infrastructure overlay ─────────────────────────────────────────
+  // Opacity slider — debounced re-render
+  const slopeOpacityTimer = useRef<ReturnType<typeof setTimeout>|null>(null);
+  const handleSlopeOpacity = (v: number) => {
+    setSlopeOpacity(v);
+    if (slopeState !== "on") return;
+    if (slopeOpacityTimer.current) clearTimeout(slopeOpacityTimer.current);
+    slopeOpacityTimer.current = setTimeout(() => updateSlopeOpacity(v).catch(()=>{}), 80);
+  };
+
+  // ── Topo contours ─────────────────────────────────────────────────────────
+  const toggleTopo = useCallback(async () => {
+    if (topoState === "loading") return;
+    if (topoState === "on") {
+      await removeTopoOverlay().catch(()=>{});
+      setTopoState("off"); setTopoMsg(""); return;
+    }
+    setTopoState("loading"); setTopoMsg("Starting…");
+    try {
+      if (!IS_IN_FORMA) {
+        await new Promise(r=>setTimeout(r,800));
+        setTopoState("on"); setTopoMsg(""); return;
+      }
+      await renderTopoOverlay(msg=>{
+        if (msg==="done"){setTopoState("on");setTopoMsg("");}
+        else setTopoMsg(msg);
+      }, topoOpacity);
+    } catch(e) {
+      setTopoState("error"); setTopoMsg(String(e).substring(0,140));
+    }
+  }, [topoState, topoOpacity]);
+
+  const topoOpacityTimer = useRef<ReturnType<typeof setTimeout>|null>(null);
+  const handleTopoOpacity = (v: number) => {
+    setTopoOpacity(v);
+    if (topoState !== "on") return;
+    if (topoOpacityTimer.current) clearTimeout(topoOpacityTimer.current);
+    topoOpacityTimer.current = setTimeout(() => updateTopoOpacity(v).catch(()=>{}), 80);
+  };
+
+  // ── Power ─────────────────────────────────────────────────────────────────
   const applyPowerOverlay = useCallback(async (
-    cache: InfraFeature[] | null,
-    layers: InfraLayer,
-    latLon: [number, number] | null
+    cache:InfraFeature[]|null, layers:InfraLayer, latLon:[number,number]|null
   ) => {
-    if (!latLon) { setPowerMsg("No project location detected"); setPowerState("error"); return; }
-
-    setPowerState("loading");
-    setPowerMsg("Fetching infrastructure data…");
-
+    if (!latLon){setPowerMsg("No project location detected");setPowerState("error");return;}
+    setPowerState("loading"); setPowerMsg("Querying OSM…");
     try {
       let features = cache;
       if (!features) {
         if (!IS_IN_FORMA) {
-          // Dev mock
-          features = [
-            { type:"substation", name:"Apex 115kV Substation", lat:35.745, lon:-78.810, voltage:"115000" },
-            { type:"substation", name:"Holly Springs 69kV",   lat:35.720, lon:-78.850, voltage:"69000"  },
-            { type:"plant",      name:"Shearon Harris Nuclear", lat:35.655, lon:-78.956, fuel:"nuclear"  },
-            { type:"plant",      name:"Lee Gas Turbine Plant", lat:35.800, lon:-78.780, fuel:"gas"      },
-            { type:"line",       name:"345kV Transmission",    lat:35.740, lon:-78.820, voltage:"345000",
-              coords:[[35.800,-78.900],[35.780,-78.860],[35.750,-78.830],[35.720,-78.800],[35.690,-78.770]] },
-            { type:"line",       name:"115kV Transmission",    lat:35.730, lon:-78.815, voltage:"115000",
-              coords:[[35.760,-78.780],[35.740,-78.810],[35.720,-78.840]] },
+          features=[
+            {type:"substation",name:"Apex 115kV Substation",lat:35.745,lon:-78.810,voltage:"115000"},
+            {type:"substation",name:"Holly Springs 69kV",lat:35.720,lon:-78.850,voltage:"69000"},
+            {type:"plant",name:"Shearon Harris Nuclear",lat:35.655,lon:-78.956},
+            {type:"line",name:"345kV Transmission",lat:35.740,lon:-78.820,voltage:"345000",
+              coords:[[35.800,-78.900],[35.750,-78.830],[35.690,-78.770]]},
           ];
-          setInfraCache(features);
         } else {
-          features = await fetchPowerInfrastructure(
-            latLon[0], latLon[1], radiusMi * 1609.34,
-            msg => setPowerMsg(msg)
-          );
-          setInfraCache(features);
+          features = await fetchPowerInfrastructure(latLon[0],latLon[1],radiusMi*1609.34,msg=>setPowerMsg(msg));
         }
+        setInfraCache(features);
       }
-
       setInfraStats({
-        subs:   features.filter(f=>f.type==="substation").length,
-        plants: features.filter(f=>f.type==="plant").length,
-        lines:  features.filter(f=>f.type==="line").length,
+        subs:features.filter(f=>f.type==="substation").length,
+        plants:features.filter(f=>f.type==="plant").length,
+        lines:features.filter(f=>f.type==="line").length,
       });
-
-      const visible = new Set<"substation"|"plant"|"line">();
+      const visible=new Set<"substation"|"plant"|"line">();
       if (layers.substations) visible.add("substation");
       if (layers.plants)      visible.add("plant");
       if (layers.lines)       visible.add("line");
-
-      if (!IS_IN_FORMA) {
-        await new Promise(r => setTimeout(r, 800));
-        setPowerState("on");
-        setPowerMsg("");
-        return;
-      }
-
-      await renderPowerOverlay(features, latLon[0], latLon[1], visible, msg => {
-        if (msg === "done") { setPowerState("on"); setPowerMsg(""); }
-        else setPowerMsg(msg);
+      if (!IS_IN_FORMA){await new Promise(r=>setTimeout(r,500));setPowerState("on");setPowerMsg("");return;}
+      await renderPowerOverlay(features,latLon[0],latLon[1],visible,msg=>{
+        if(msg==="done"){setPowerState("on");setPowerMsg("");}else setPowerMsg(msg);
       });
-    } catch(e) {
-      setPowerState("error");
-      setPowerMsg(String(e));
-    }
+    } catch(e){setPowerState("error");setPowerMsg(String(e).substring(0,140));}
   }, [radiusMi]);
 
   const togglePower = useCallback(async () => {
-    if (powerState === "loading") return;
-    if (powerState === "on") {
-      await removePowerOverlay();
-      setPowerState("off");
-      setPowerMsg("");
-      return;
-    }
-    await applyPowerOverlay(infraCache, infraLayers, refLatLon);
-  }, [powerState, infraCache, infraLayers, refLatLon, applyPowerOverlay]);
+    if (powerState==="loading") return;
+    if (powerState==="on"){await removePowerOverlay().catch(()=>{});setPowerState("off");setPowerMsg("");return;}
+    await applyPowerOverlay(infraCache,infraLayers,refLatLon);
+  }, [powerState,infraCache,infraLayers,refLatLon,applyPowerOverlay]);
 
-  // When layers toggle while on, re-render
   const prevLayersRef = useRef(infraLayers);
-  useEffect(() => {
-    if (powerState === "on" &&
-      (prevLayersRef.current.substations !== infraLayers.substations ||
-       prevLayersRef.current.plants      !== infraLayers.plants ||
-       prevLayersRef.current.lines       !== infraLayers.lines)) {
-      applyPowerOverlay(infraCache, infraLayers, refLatLon);
-    }
-    prevLayersRef.current = infraLayers;
-  }, [infraLayers, powerState, infraCache, refLatLon, applyPowerOverlay]);
+  useEffect(()=>{
+    const prev=prevLayersRef.current;
+    if (powerState==="on"&&(prev.substations!==infraLayers.substations||prev.plants!==infraLayers.plants||prev.lines!==infraLayers.lines))
+      applyPowerOverlay(infraCache,infraLayers,refLatLon);
+    prevLayersRef.current=infraLayers;
+  },[infraLayers,powerState,infraCache,refLatLon,applyPowerOverlay]);
 
-  const toggleLayer = (key: keyof InfraLayer) =>
-    setInfraLayers(prev => ({ ...prev, [key]: !prev[key] }));
-
-  const clearCache = () => {
-    setInfraCache(null);
-    setInfraStats(null);
-    if (powerState === "on") { removePowerOverlay(); setPowerState("off"); }
+  const toggleLayer=(k:keyof InfraLayer)=>setInfraLayers(p=>({...p,[k]:!p[k]}));
+  const clearCache=()=>{
+    setInfraCache(null);setInfraStats(null);
+    clearTerrainCache();
+    if(powerState==="on"){removePowerOverlay().catch(()=>{});setPowerState("off");}
   };
 
   return (
-    <div style={{background:"#fff",fontFamily:"'Inter',system-ui,sans-serif",minHeight:"100%"}}>
-      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+    <div style={{fontFamily:"'Inter',system-ui,sans-serif",background:"#fff",width:"100%",boxSizing:"border-box"}}>
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}} *{box-sizing:border-box}`}</style>
 
       {/* Header */}
-      <div style={{padding:"14px 16px 12px",borderBottom:`1px solid ${T.border}`}}>
-        <div style={{fontSize:14,fontWeight:600,color:T.tx1,lineHeight:1}}>Site Overlays</div>
-        <div style={{fontSize:11,color:T.tx3,marginTop:3}}>
-          Terrain analysis · Power infrastructure
-          {refLatLon && !IS_IN_FORMA && <span style={{color:T.warn}}> · Dev mode</span>}
-        </div>
+      <div style={{padding:"12px 14px 10px",borderBottom:`1px solid ${T.border}`}}>
+        <div style={{fontSize:14,fontWeight:600,color:T.tx1}}>Site Overlays</div>
+        <div style={{fontSize:11,color:T.tx3,marginTop:2}}>Slope · Contours · Power infrastructure</div>
       </div>
 
-      <div style={{padding:"12px 16px",display:"flex",flexDirection:"column",gap:12}}>
+      <div style={{padding:"10px 14px",display:"flex",flexDirection:"column",gap:10}}>
 
-        {/* ── Slope Overlay ────────────────────────────────────────────── */}
-        <OverlayCard
-          title="Slope analysis"
-          icon="📐"
-          state={slopeState}
-          msg={slopeMsg}
-          onToggle={toggleSlope}
-          activeColor="#2ecc71"
-          description="Color-codes terrain slope across the site. Identifies buildable areas and grading challenges."
-        >
-          {/* Legend */}
-          <div style={{marginTop:8}}>
-            <div style={{fontSize:10,fontWeight:500,color:T.tx3,textTransform:"uppercase",letterSpacing:.4,marginBottom:4}}>Color legend</div>
-            <div style={{display:"flex",flexDirection:"column",gap:3}}>
-              {SLOPE_BANDS.map(band => (
-                <div key={band.label} style={{display:"flex",alignItems:"center",gap:6}}>
-                  <div style={{width:16,height:16,borderRadius:3,background:band.color,border:"1px solid rgba(0,0,0,.1)",flexShrink:0}}/>
+        {/* ── Slope ──────────────────────────────────────────────────────── */}
+        <OverlayCard title="Slope analysis" iconChar="S" iconBg="#e8f5e9" iconColor="#2ecc71"
+          state={slopeState} msg={slopeMsg} onToggle={toggleSlope} activeColor="#2ecc71"
+          description="Per-triangle slope computed from terrain mesh face normals.">
+          <>
+            {/* Opacity slider */}
+            <div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${T.border}`}}>
+              <OpacitySlider label="Opacity" value={slopeOpacity} onChange={handleSlopeOpacity} color="#2ecc71"/>
+            </div>
+            {/* Legend */}
+            <div style={{marginTop:8}}>
+              <div style={{fontSize:10,fontWeight:600,color:T.tx3,textTransform:"uppercase",letterSpacing:.5,marginBottom:5}}>Color legend</div>
+              {SLOPE_BANDS.map(band=>(
+                <div key={band.label} style={{display:"flex",alignItems:"center",gap:7,marginBottom:3}}>
+                  <div style={{width:14,height:14,borderRadius:2,flexShrink:0,background:band.color,border:"1px solid rgba(0,0,0,.08)"}}/>
                   <span style={{fontSize:11,color:T.tx2}}>{band.label}</span>
                 </div>
               ))}
             </div>
-          </div>
-
-          {slopeState === "on" && (
-            <div style={{marginTop:8,fontSize:11,color:T.green,fontWeight:500}}>
-              ✓ Slope overlay active — visible in Forma 3D view
-            </div>
-          )}
+          </>
         </OverlayCard>
 
-        {/* ── Power Infrastructure Overlay ─────────────────────────────── */}
-        <OverlayCard
-          title="Power infrastructure"
-          icon="⚡"
-          state={powerState}
-          msg={powerMsg}
-          onToggle={togglePower}
-          activeColor={T.blue}
-          description="Shows HV substations, power plants, and transmission lines from OpenStreetMap within the search radius."
-        >
-          {/* Radius */}
-          <div style={{marginTop:8}}>
-            <div style={{fontSize:10,fontWeight:500,color:T.tx3,textTransform:"uppercase",letterSpacing:.4,marginBottom:4}}>
-              Search radius: {radiusMi} mi
-            </div>
-            <div style={{display:"flex",alignItems:"center",gap:8}}>
-              <input type="range" min={5} max={50} step={5} value={radiusMi}
-                onChange={e=>{ setRadiusMi(+e.target.value); clearCache(); }}
-                onMouseDown={e=>e.stopPropagation()}
-                style={{flex:1,accentColor:T.blue}}/>
-              <span style={{fontSize:11,fontWeight:500,color:T.blue,minWidth:36,textAlign:"right"}}>{radiusMi} mi</span>
-            </div>
-            {infraCache && (
-              <button onClick={clearCache}
-                style={{marginTop:4,fontSize:10,color:T.tx3,background:"none",border:"none",
-                  cursor:"pointer",padding:0,textDecoration:"underline"}}>
-                Clear cached data
-              </button>
-            )}
-          </div>
-
-          {/* Layer toggles */}
-          <div style={{marginTop:8}}>
-            <div style={{fontSize:10,fontWeight:500,color:T.tx3,textTransform:"uppercase",letterSpacing:.4,marginBottom:4}}>Layers</div>
-            <div style={{display:"flex",flexDirection:"column",gap:4}}>
-              {[
-                { key:"substations" as keyof InfraLayer, label:"HV Substations",       color:T.blue,   icon:"■", count:infraStats?.subs  },
-                { key:"plants"      as keyof InfraLayer, label:"Power plants",          color:"#e67e22", icon:"●", count:infraStats?.plants },
-                { key:"lines"       as keyof InfraLayer, label:"Transmission lines",    color:"#e74c3c", icon:"—", count:infraStats?.lines  },
-              ].map(({key,label,color,icon,count}) => (
-                <div key={key} onClick={()=>toggleLayer(key)}
-                  style={{display:"flex",alignItems:"center",gap:8,padding:"6px 8px",
-                    borderRadius:5,cursor:"pointer",border:`1px solid ${infraLayers[key]?color+"55":T.border}`,
-                    background:infraLayers[key]?`${color}0d`:"#fafafa",transition:"all .12s"}}>
-                  <span style={{fontSize:14,color,lineHeight:1}}>{icon}</span>
-                  <span style={{flex:1,fontSize:12,color:infraLayers[key]?T.tx1:T.tx3,fontWeight:infraLayers[key]?500:400}}>{label}</span>
-                  {count !== undefined && <span style={{fontSize:10,color:T.tx3}}>{count}</span>}
-                  <div style={{width:16,height:16,borderRadius:8,border:`1.5px solid ${infraLayers[key]?color:"#ccc"}`,
-                    background:infraLayers[key]?color:"#fff",display:"flex",alignItems:"center",justifyContent:"center"}}>
-                    {infraLayers[key] && <div style={{width:6,height:6,borderRadius:3,background:"#fff"}}/>}
-                  </div>
-                </div>
-              ))}
+        {/* ── Topo contours ──────────────────────────────────────────────── */}
+        <OverlayCard title="Topo contour lines" iconChar="T" iconBg="#fdf6e3" iconColor={T.brown}
+          state={topoState} msg={topoMsg} onToggle={toggleTopo} activeColor={T.brown}
+          description="Contour lines traced via marching squares. Minor every 5m, major every 25m.">
+          <div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${T.border}`}}>
+            <OpacitySlider label="Opacity" value={topoOpacity} onChange={handleTopoOpacity} color={T.brown}/>
+            <div style={{fontSize:10,color:T.tx3,marginTop:6}}>
+              Renders below slope layer (z=1). Best used with slope opacity at 60–75%.
             </div>
           </div>
+        </OverlayCard>
 
-          {/* Infrastructure summary */}
-          {infraStats && powerState === "on" && (
-            <div style={{marginTop:8,padding:"8px 10px",background:T.blueLt,borderRadius:5,border:`1px solid ${T.blueMid}`}}>
-              <div style={{fontSize:11,fontWeight:500,color:T.blue,marginBottom:3}}>✓ Infrastructure overlay active</div>
-              <div style={{fontSize:10,color:T.tx2}}>
-                {infraStats.subs} substations · {infraStats.plants} plants · {infraStats.lines} transmission lines
-                <br/>within {radiusMi} mi · Source: OpenStreetMap
+        {/* ── Power ──────────────────────────────────────────────────────── */}
+        <OverlayCard title="Power infrastructure" iconChar="P" iconBg={T.blueLt} iconColor={T.blue}
+          state={powerState} msg={powerMsg} onToggle={togglePower} activeColor={T.blue}
+          description="HV substations, power plants, and transmission lines from OpenStreetMap.">
+          <div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${T.border}`}}>
+            {/* Radius */}
+            <div style={{marginBottom:10}}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+                <span style={{fontSize:11,color:T.tx2}}>Search radius</span>
+                <span style={{fontSize:11,fontWeight:600,color:T.blue}}>{radiusMi} mi</span>
               </div>
+              <input type="range" min={5} max={50} step={5} value={radiusMi}
+                onChange={e=>{setRadiusMi(+e.target.value);clearCache();}}
+                onMouseDown={e=>e.stopPropagation()}
+                style={{width:"100%",accentColor:T.blue,display:"block"}}/>
             </div>
-          )}
+            {/* Layer toggles */}
+            <div style={{fontSize:10,fontWeight:600,color:T.tx3,textTransform:"uppercase",letterSpacing:.5,marginBottom:5}}>Layers</div>
+            {([
+              {key:"substations" as keyof InfraLayer,label:"HV Substations",color:T.blue,sym:"■"},
+              {key:"plants"      as keyof InfraLayer,label:"Power plants",   color:"#e67e22",sym:"●"},
+              {key:"lines"       as keyof InfraLayer,label:"Trans. lines",   color:"#e74c3c",sym:"—"},
+            ] as const).map(({key,label,color,sym})=>(
+              <div key={key} onClick={()=>toggleLayer(key)}
+                style={{display:"flex",alignItems:"center",gap:7,padding:"5px 7px",marginBottom:3,
+                  borderRadius:4,cursor:"pointer",
+                  border:`1px solid ${infraLayers[key]?color+"44":T.border}`,
+                  background:infraLayers[key]?`${color}0d`:"#fafafa",transition:"all .1s"}}>
+                <span style={{fontSize:13,color,fontWeight:"bold",width:14,textAlign:"center"}}>{sym}</span>
+                <span style={{flex:1,fontSize:11,color:infraLayers[key]?T.tx1:T.tx3,fontWeight:infraLayers[key]?500:400}}>{label}</span>
+                {infraStats&&<span style={{fontSize:10,color:T.tx3}}>{key==="substations"?infraStats.subs:key==="plants"?infraStats.plants:infraStats.lines}</span>}
+                <div style={{width:15,height:15,borderRadius:3,border:`1.5px solid ${infraLayers[key]?color:"#ccc"}`,
+                  background:infraLayers[key]?color:"#fff",display:"flex",alignItems:"center",justifyContent:"center"}}>
+                  {infraLayers[key]&&<span style={{color:"#fff",fontSize:9,fontWeight:"bold"}}>✓</span>}
+                </div>
+              </div>
+            ))}
+            {infraStats&&powerState==="on"&&(
+              <div style={{marginTop:7,padding:"7px 8px",background:T.blueLt,borderRadius:4,
+                border:`1px solid ${T.blueMid}`,fontSize:11,color:T.tx2}}>
+                <span style={{color:T.blue,fontWeight:500}}>✓ Active</span>
+                {" · "}{infraStats.subs} sub · {infraStats.plants} plant · {infraStats.lines} lines
+                <br/><span style={{fontSize:10,color:T.tx3}}>OpenStreetMap · {radiusMi} mi</span>
+              </div>
+            )}
+            {infraCache&&<button onClick={clearCache}
+              style={{marginTop:7,fontSize:10,color:T.tx3,background:"none",border:"none",cursor:"pointer",padding:0,textDecoration:"underline",display:"block"}}>
+              Clear cached data
+            </button>}
+          </div>
         </OverlayCard>
 
         {/* Attribution */}
-        <div style={{fontSize:10,color:T.tx3,lineHeight:1.4,padding:"4px 0"}}>
-          Infrastructure data © OpenStreetMap contributors (ODbL). Slope computed from Forma terrain mesh.
+        <div style={{fontSize:10,color:T.tx3,lineHeight:1.5,paddingBottom:12}}>
+          Infrastructure © OpenStreetMap contributors (ODbL).
+          Slope &amp; contours from Forma terrain mesh.
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── OpacitySlider ────────────────────────────────────────────────────────────
+
+function OpacitySlider({label,value,onChange,color}:{label:string;value:number;onChange:(v:number)=>void;color:string}) {
+  return (
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:3}}>
+        <span style={{fontSize:11,color:"#555"}}>{label}</span>
+        <span style={{fontSize:11,fontWeight:600,color}}>{Math.round(value*100)}%</span>
+      </div>
+      <input type="range" min={0.1} max={1.0} step={0.05} value={value}
+        onChange={e=>onChange(+e.target.value)}
+        onMouseDown={e=>e.stopPropagation()}
+        style={{width:"100%",accentColor:color,display:"block"}}/>
+      <div style={{display:"flex",justifyContent:"space-between",marginTop:1}}>
+        <span style={{fontSize:9,color:"#bbb"}}>10%</span>
+        <span style={{fontSize:9,color:"#bbb"}}>100%</span>
       </div>
     </div>
   );
@@ -301,73 +299,55 @@ export default function OverlaysApp() {
 
 // ─── OverlayCard ─────────────────────────────────────────────────────────────
 
-function OverlayCard({title, icon, state, msg, onToggle, activeColor, description, children}: {
-  title: string; icon: string; state: OverlayState; msg: string;
-  onToggle: ()=>void; activeColor: string; description: string;
-  children?: React.ReactNode;
+function OverlayCard({title,iconChar,iconBg,iconColor,state,msg,onToggle,activeColor,description,children}:{
+  title:string;iconChar:string;iconBg:string;iconColor:string;
+  state:OverlayState;msg:string;onToggle:()=>void;
+  activeColor:string;description:string;children?:React.ReactNode;
 }) {
-  const isOn      = state === "on";
-  const isLoading = state === "loading";
-  const isError   = state === "error";
-
+  const isOn=state==="on", isLoading=state==="loading", isError=state==="error";
   return (
-    <div style={{border:`1px solid ${isOn?activeColor+"66":isError?"#f0a090":"#e2e2e2"}`,
-      borderRadius:8,overflow:"hidden",
-      boxShadow:isOn?`0 0 0 2px ${activeColor}22`:"none",transition:"all .2s"}}>
-
-      {/* Card header */}
-      <div style={{padding:"10px 12px",background:isOn?`${activeColor}0d`:"#fff"}}>
-        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6}}>
-          <div style={{display:"flex",alignItems:"center",gap:8}}>
-            <span style={{fontSize:16}}>{icon}</span>
-            <span style={{fontSize:13,fontWeight:500,color:isOn?activeColor:"#1a1a1a"}}>{title}</span>
+    <div style={{border:`1px solid ${isOn?activeColor+"88":isError?"#f0a090":"#e2e2e2"}`,
+      borderRadius:8,background:"#fff",overflow:"hidden",
+      boxShadow:isOn?`0 0 0 2px ${activeColor}18`:"none",transition:"all .2s"}}>
+      <div style={{padding:"10px 12px",background:isOn?`${activeColor}09`:"#fff"}}>
+        <div style={{display:"flex",alignItems:"center",gap:9,marginBottom:4}}>
+          <div style={{width:28,height:28,borderRadius:5,background:iconBg,flexShrink:0,
+            display:"flex",alignItems:"center",justifyContent:"center"}}>
+            <span style={{fontSize:12,fontWeight:700,color:iconColor}}>{iconChar}</span>
           </div>
-          <Toggle active={isOn} loading={isLoading} color={activeColor} onClick={onToggle}/>
+          <span style={{flex:1,fontSize:13,fontWeight:500,color:isOn?activeColor:"#1a1a1a"}}>{title}</span>
+          {/* Toggle switch */}
+          <div onClick={isLoading?undefined:onToggle}
+            style={{width:42,height:23,borderRadius:12,background:isOn?activeColor:"#ccc",
+              cursor:isLoading?"default":"pointer",flexShrink:0,
+              display:"flex",alignItems:"center",padding:"0 3px",
+              justifyContent:isOn?"flex-end":"flex-start",transition:"background .2s"}}>
+            {isLoading
+              ? <div style={{width:17,height:17,borderRadius:9,background:"rgba(255,255,255,0.5)",
+                  border:"2px solid #fff",borderTopColor:"transparent",
+                  animation:"spin 0.8s linear infinite"}}/>
+              : <div style={{width:17,height:17,borderRadius:9,background:"#fff",
+                  boxShadow:"0 1px 3px rgba(0,0,0,.2)"}}/>}
+          </div>
         </div>
-        <div style={{fontSize:11,color:"#777",lineHeight:1.4}}>{description}</div>
-
-        {/* Loading progress */}
-        {isLoading && msg && (
-          <div style={{marginTop:6,display:"flex",alignItems:"center",gap:6}}>
-            <div style={{width:12,height:12,border:`2px solid ${activeColor}`,borderTop:"2px solid transparent",
-              borderRadius:"50%",animation:"spin 1s linear infinite",flexShrink:0}}/>
+        <div style={{fontSize:11,color:"#777",lineHeight:1.3,paddingLeft:37}}>{description}</div>
+        {isLoading&&msg&&(
+          <div style={{display:"flex",alignItems:"center",gap:6,marginTop:5,paddingLeft:37}}>
+            <div style={{width:9,height:9,borderRadius:5,flexShrink:0,border:`2px solid ${activeColor}`,
+              borderTopColor:"transparent",animation:"spin 0.8s linear infinite"}}/>
             <span style={{fontSize:11,color:"#555"}}>{msg}</span>
           </div>
         )}
-
-        {/* Error */}
-        {isError && (
-          <div style={{marginTop:6,fontSize:11,color:"#c24b2a",background:"#fff0ed",
-            padding:"6px 8px",borderRadius:4,border:"1px solid #f0a090"}}>{msg}</div>
+        {isError&&msg&&(
+          <div style={{marginTop:5,padding:"5px 7px",borderRadius:4,
+            background:"#fff0ed",border:"1px solid #f0a090",fontSize:11,color:"#c24b2a",paddingLeft:37}}>{msg}</div>
         )}
       </div>
-
-      {/* Children (legend, controls) — always shown */}
-      {children && (
-        <div style={{padding:"0 12px 12px",borderTop:`1px solid ${isOn?activeColor+"33":"#e2e2e2"}`,
-          background:isOn?`${activeColor}05`:"#fafafa"}}>
+      {children&&(
+        <div style={{padding:"0 12px 12px",background:isOn?`${activeColor}05`:"#fafafa"}}>
           {children}
         </div>
       )}
-    </div>
-  );
-}
-
-function Toggle({active, loading, color, onClick}: {
-  active: boolean; loading: boolean; color: string; onClick: ()=>void;
-}) {
-  return (
-    <div onClick={loading?undefined:onClick}
-      style={{width:40,height:22,borderRadius:11,cursor:loading?"not-allowed":"pointer",
-        background:active?color:"#ccc",position:"relative",transition:"background .2s",flexShrink:0}}>
-      {loading
-        ? <div style={{position:"absolute",top:"50%",left:"50%",transform:"translate(-50%,-50%)",
-            width:14,height:14,border:"2px solid #fff",borderTop:"2px solid transparent",
-            borderRadius:"50%",animation:"spin 1s linear infinite"}}/>
-        : <div style={{position:"absolute",top:2,left:active?20:2,width:18,height:18,
-            borderRadius:9,background:"#fff",transition:"left .2s",
-            boxShadow:"0 1px 3px rgba(0,0,0,.2)"}}/>
-      }
     </div>
   );
 }
