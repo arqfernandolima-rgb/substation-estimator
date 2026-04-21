@@ -24,89 +24,122 @@ export async function renderSlopeOverlay(
 ): Promise<void> {
   const { Forma } = await import("forma-embedded-view-sdk/auto");
 
-  onProgress("Reading terrain bounds…");
-  const bbox = await Forma.terrain.getBbox();
-  const minX = bbox.min.x, minY = bbox.min.y;
-  const maxX = bbox.max.x, maxY = bbox.max.y;
-  const W = maxX - minX;  // meters
-  const H = maxY - minY;  // meters
+  // ── Step 1: Get terrain mesh in ONE call ──────────────────────────────────
+  // getTriangles() returns the entire terrain as a flat Float32Array:
+  // [x1,y1,z1, x2,y2,z2, x3,y3,z3, ...] — all vertices of all triangles.
+  // This is a single async round-trip, unlike getElevationAt() which requires
+  // one round-trip per sample point.
 
-  // Resolution: ~2 m per sample — enough for good slope detail
-  const CELL = 2;
+  onProgress("Reading terrain mesh…");
+
+  const terrainPaths = await Forma.geometry.getPathsByCategory({ category: "terrain" });
+  if (!terrainPaths?.length) throw new Error("No terrain found in this project.");
+
+  const triangles = await Forma.geometry.getTriangles({ path: terrainPaths[0] });
+  if (!triangles || triangles.length < 9) throw new Error("Could not read terrain geometry.");
+
+  onProgress("Computing slope from mesh…");
+
+  // ── Step 2: Find mesh bounds ───────────────────────────────────────────────
+  let minX = Infinity, maxX = -Infinity;
+  let minY = Infinity, maxY = -Infinity;
+  for (let i = 0; i < triangles.length; i += 3) {
+    const x = triangles[i], y = triangles[i + 1];
+    if (x < minX) minX = x;  if (x > maxX) maxX = x;
+    if (y < minY) minY = y;  if (y > maxY) maxY = y;
+  }
+
+  const W = maxX - minX, H = maxY - minY;
+  const CELL = 4; // 4 m per grid cell — good visual resolution
   const cols = Math.ceil(W / CELL);
   const rows = Math.ceil(H / CELL);
 
-  onProgress(`Sampling ${cols}×${rows} elevation grid…`);
+  // ── Step 3: Bin all vertices into a regular elevation grid (pure CPU) ──────
+  // Each grid cell gets the average Z of all terrain vertices that fall in it.
+  const elevSum   = new Float64Array(rows * cols);
+  const elevCount = new Uint32Array(rows * cols);
 
-  // Sample all elevations row by row
-  const elev: Float32Array = new Float32Array(rows * cols);
-  let sampled = 0;
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const x = minX + c * CELL + CELL / 2;
-      const y = minY + r * CELL + CELL / 2;
-      try {
-        elev[r * cols + c] = await Forma.terrain.getElevationAt({ x, y });
-      } catch {
-        elev[r * cols + c] = bbox.min.z;
-      }
-      sampled++;
+  for (let i = 0; i < triangles.length; i += 3) {
+    const x = triangles[i], y = triangles[i + 1], z = triangles[i + 2];
+    const c = Math.min(cols - 1, Math.floor((x - minX) / CELL));
+    const r = Math.min(rows - 1, Math.floor((y - minY) / CELL));
+    if (c >= 0 && r >= 0) {
+      elevSum[r * cols + c]   += z;
+      elevCount[r * cols + c] += 1;
     }
-    if (r % 10 === 0) onProgress(`Sampling elevation… ${Math.round(sampled / (rows * cols) * 100)}%`);
   }
 
-  onProgress("Computing slope bands…");
+  const elev = new Float32Array(rows * cols);
+  let fallbackZ = 0;
+  for (let i = 0; i < elev.length; i++) {
+    elev[i] = elevCount[i] > 0 ? elevSum[i] / elevCount[i] : NaN;
+    if (elevCount[i] > 0 && fallbackZ === 0) fallbackZ = elev[i];
+  }
 
-  // Create canvas — 1 pixel = 1 cell
+  // Fill empty cells (no vertices landed there) with nearest valid neighbor
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const i = r * cols + c;
+      if (!isNaN(elev[i])) continue;
+      const neighbors = [
+        r > 0      ? elev[(r-1)*cols+c]   : NaN,
+        r < rows-1 ? elev[(r+1)*cols+c]   : NaN,
+        c > 0      ? elev[r*cols+(c-1)]   : NaN,
+        c < cols-1 ? elev[r*cols+(c+1)]   : NaN,
+      ].filter(v => !isNaN(v));
+      elev[i] = neighbors.length ? neighbors.reduce((a,b)=>a+b,0)/neighbors.length : fallbackZ;
+    }
+  }
+
+  // ── Step 4: Compute slope per cell & draw canvas ───────────────────────────
+  onProgress("Rendering slope bands…");
+
   const canvas = document.createElement("canvas");
   canvas.width  = cols;
   canvas.height = rows;
-  const ctx = canvas.getContext("2d")!;
+  const ctx     = canvas.getContext("2d")!;
   const imgData = ctx.createImageData(cols, rows);
-  const px = imgData.data;
+  const px      = imgData.data;
 
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
       const idx = r * cols + c;
-      const z   = elev[idx];
 
-      // Central differences for slope — use available neighbors
-      const zE = c < cols-1 ? elev[idx + 1]    : z;
-      const zW = c > 0      ? elev[idx - 1]    : z;
-      const zN = r < rows-1 ? elev[idx + cols] : z;
-      const zS = r > 0      ? elev[idx - cols] : z;
+      // Central differences (fall back to one-sided at edges)
+      const zE = c < cols-1 ? elev[idx + 1]    : elev[idx];
+      const zW = c > 0      ? elev[idx - 1]    : elev[idx];
+      const zN = r < rows-1 ? elev[idx + cols] : elev[idx];
+      const zS = r > 0      ? elev[idx - cols] : elev[idx];
 
-      const dzdx = (zE - zW) / (2 * CELL);
-      const dzdy = (zN - zS) / (2 * CELL);
-      const slopeDeg = Math.atan(Math.sqrt(dzdx**2 + dzdy**2)) * 180 / Math.PI;
-      const pct = Math.tan(slopeDeg * Math.PI / 180) * 100;
+      const dzdx  = (zE - zW) / (2 * CELL);
+      const dzdy  = (zN - zS) / (2 * CELL);
+      const pct   = Math.sqrt(dzdx ** 2 + dzdy ** 2) * 100;
 
-      const band = SLOPE_BANDS.find(b => pct <= b.max) ?? SLOPE_BANDS[SLOPE_BANDS.length - 1];
+      const band  = SLOPE_BANDS.find(b => pct <= b.max) ?? SLOPE_BANDS[SLOPE_BANDS.length - 1];
       const [rr, gg, bb] = hexToRgb(band.color);
-      const alpha = Math.round(band.alpha * 255);
 
-      const pi = (r * cols + c) * 4;
-      px[pi]   = rr;
-      px[pi+1] = gg;
-      px[pi+2] = bb;
-      px[pi+3] = alpha;
+      const pi    = (r * cols + c) * 4;
+      px[pi]      = rr;
+      px[pi + 1]  = gg;
+      px[pi + 2]  = bb;
+      px[pi + 3]  = Math.round(band.alpha * 255);
     }
   }
   ctx.putImageData(imgData, 0, 0);
 
+  // ── Step 5: Push canvas to terrain as ground texture ─────────────────────
   onProgress("Applying overlay to terrain…");
 
   const centerX = (minX + maxX) / 2;
   const centerY = (minY + maxY) / 2;
 
-  // Remove any existing slope texture first
   try { await Forma.terrain.groundTexture.remove({ name: "slope-overlay" }); } catch { /* ok */ }
 
   await Forma.terrain.groundTexture.add({
-    name: "slope-overlay",
+    name:     "slope-overlay",
     canvas,
     position: { x: centerX, y: centerY, z: 1 },
-    scale: { x: CELL, y: CELL },  // each pixel = CELL meters
+    scale:    { x: CELL, y: CELL },
   });
 
   onProgress("done");
