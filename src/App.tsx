@@ -7,6 +7,8 @@ import {
   REGIONS, TERRAIN_TYPES, BUILDING_FUNCTIONS,
   type Config, type VCKey, type BusKey, type SWKey,
   type RegionKey, type TerrainKey, type AuxKey,
+  type GridConnection, type GridConnectionKind, type GridSourceType,
+  INTERCON_LINE_COSTS, INTERCON_TAP_COSTS,
 } from "./lib/compute";
 import { exportCSV } from "./lib/export";
 import { STANDARDS, ASSUMPTIONS } from "./lib/standards";
@@ -73,6 +75,13 @@ export default function App() {
   const [bldgStatus,  setBldgStatus]  = useState<string|null>(null);
   // Building function picker state: path of building being assigned a function
   const [pickingFn,   setPickingFn]   = useState<string|null>(null);
+
+  // Grid connection state
+  const [gridConn,    setGridConn]    = useState<GridConnection|undefined>(undefined);
+  const [showGrid,    setShowGrid]    = useState(false);
+  const [gridFeatures,setGridFeatures]= useState<{name:string;sourceType:GridSourceType;lat:number;lon:number;voltageKV?:number;distanceMi:number}[]>([]);
+  const [gridLoading, setGridLoading] = useState(false);
+  const [gridFetched, setGridFetched] = useState(false);
 
   // Auto-sync Forma buildings into auxStructures when detected or updated
   const prevBuildingPaths = useRef<Set<string>>(new Set());
@@ -528,6 +537,48 @@ export default function App() {
             </div>
           )}
 
+          {/* Grid connection */}
+          <div style={{padding:"0 16px 0"}}>
+            <div onClick={()=>{
+                setShowGrid(!showGrid);
+                if(!showGrid && !gridFetched && siteData?.lat && siteData?.lon) {
+                  setGridLoading(true);
+                  fetchNearbyInfra(siteData.lat, siteData.lon).then(feats=>{
+                    setGridFeatures(feats);
+                    setGridFetched(true);
+                    setGridLoading(false);
+                  }).catch(()=>setGridLoading(false));
+                }
+              }}
+              style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+                padding:"8px 12px",cursor:"pointer",border:`1px solid ${gridConn?T.blue:T.border}`,
+                borderRadius:showGrid?"6px 6px 0 0":6,background:showGrid?T.blueLt:gridConn?T.blueLt:"#fff"}}>
+              <div style={{display:"flex",alignItems:"center",gap:8}}>
+                {gridConn
+                  ?<span style={{fontSize:12,color:T.green}}>✓</span>
+                  :<span style={{width:12,height:12,borderRadius:6,border:`1.5px solid ${showGrid?T.blue:"#ccc"}`,display:"inline-block"}}/>}
+                <span style={{fontSize:12,fontWeight:showGrid?500:400,color:showGrid?T.blue:T.tx1}}>Grid connection</span>
+                <span style={{fontSize:10,color:T.tx3,background:"#f0f0f0",padding:"1px 5px",borderRadius:3}}>optional</span>
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:6}}>
+                {gridConn&&!showGrid&&<span style={{fontSize:11,color:T.tx2}}>{gridConn.name.substring(0,20)} · {gridConn.distanceMi} mi</span>}
+                <span style={{fontSize:12,color:T.tx3,display:"inline-block",transition:"transform .15s",transform:showGrid?"rotate(90deg)":"none"}}>›</span>
+              </div>
+            </div>
+
+            {showGrid&&(
+              <div style={{border:`1px solid ${T.blueMid}`,borderTop:"none",borderRadius:"0 0 6px 6px",
+                padding:"10px 12px",background:"#fff"}}>
+                <GridConnectionPicker
+                  features={gridFeatures} loading={gridLoading}
+                  selected={gridConn} vcKey={cfg.vc}
+                  onSelect={gc=>setGridConn(gc)}
+                  onClear={()=>setGridConn(undefined)}
+                />
+              </div>
+            )}
+          </div>
+
           <div style={{padding:"14px 16px 20px"}}>
             <button disabled={!ready} onClick={()=>setStage("results")}
               style={{width:"100%",padding:"10px",fontSize:13,fontWeight:500,
@@ -775,4 +826,194 @@ function ParamInput({id,val,cfg,onSet,onSetVal}:{id:keyof Config;val:unknown;cfg
     }
     default: return null;
   }
+}
+
+// ─── Fetch nearby infrastructure from OSM ─────────────────────────────────────
+
+async function fetchNearbyInfra(
+  lat: number, lon: number, radiusM = 40000
+): Promise<{name:string;sourceType:GridSourceType;lat:number;lon:number;voltageKV?:number;distanceMi:number}[]> {
+  const query = `
+    [out:json][timeout:20];
+    (
+      node["power"="substation"]["voltage"~"^[1-9][0-9]{4,}"](around:${radiusM},${lat},${lon});
+      way["power"="substation"]["voltage"~"^[1-9][0-9]{4,}"](around:${radiusM},${lat},${lon});
+      way["power"="line"]["voltage"~"^[1-9][0-9]{4,}"](around:${radiusM},${lat},${lon});
+    );
+    out center;
+  `;
+  const resp = await fetch("https://overpass-api.de/api/interpreter", {
+    method: "POST",
+    body: `data=${encodeURIComponent(query)}`,
+  });
+  if (!resp.ok) throw new Error("OSM fetch failed");
+  const data = await resp.json();
+
+  const haversine = (la1:number,lo1:number,la2:number,lo2:number) => {
+    const R=3958.8, dr=((la2-la1)*Math.PI)/180, dc=((lo2-lo1)*Math.PI)/180;
+    const a=Math.sin(dr/2)**2+Math.cos(la1*Math.PI/180)*Math.cos(la2*Math.PI/180)*Math.sin(dc/2)**2;
+    return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+  };
+
+  const features: {name:string;sourceType:GridSourceType;lat:number;lon:number;voltageKV?:number;distanceMi:number}[] = [];
+  for (const el of data.elements ?? []) {
+    const clat = el.lat ?? el.center?.lat;
+    const clon = el.lon ?? el.center?.lon;
+    if (!clat || !clon) continue;
+    const tags = el.tags ?? {};
+    const power = tags.power;
+    const rawV  = parseInt(tags.voltage ?? "0");
+    const voltageKV = rawV >= 1000 ? rawV / 1000 : rawV || undefined;
+    const distanceMi = Math.round(haversine(lat, lon, clat, clon) * 10) / 10;
+    const name = tags.name || (power==="substation"
+      ? `${voltageKV ? voltageKV+"kV " : ""}Substation`
+      : `${voltageKV ? voltageKV+"kV " : ""}Transmission Line`);
+    features.push({
+      name,
+      sourceType: power==="substation" ? "substation" : "line",
+      lat: clat, lon: clon, voltageKV, distanceMi,
+    });
+  }
+  // Sort by distance, cap at 30
+  return features.sort((a,b)=>a.distanceMi-b.distanceMi).slice(0,30);
+}
+
+// ─── GridConnectionPicker component ───────────────────────────────────────────
+
+function GridConnectionPicker({features, loading, selected, vcKey, onSelect, onClear}: {
+  features: {name:string;sourceType:GridSourceType;lat:number;lon:number;voltageKV?:number;distanceMi:number}[];
+  loading: boolean;
+  selected: GridConnection|undefined;
+  vcKey: import("./lib/compute").VCKey | undefined;
+  onSelect: (gc:GridConnection)=>void;
+  onClear: ()=>void;
+}) {
+  const [kind, setKind] = useState<GridConnectionKind>(selected?.kind ?? "overhead");
+  const [picked, setPicked] = useState<string|null>(selected?.name ?? null);
+
+  const handlePick = (f: typeof features[0]) => {
+    setPicked(f.name);
+    onSelect({ name:f.name, sourceType:f.sourceType, distanceMi:f.distanceMi, kind, voltageKV:f.voltageKV });
+  };
+
+  const handleKindChange = (k: GridConnectionKind) => {
+    setKind(k);
+    if (selected) onSelect({ ...selected, kind:k });
+  };
+
+  // Cost preview
+  const previewCost = (f: typeof features[0]) => {
+    if (!vcKey) return null;
+    const lc = INTERCON_LINE_COSTS[kind][vcKey];
+    const tap = INTERCON_TAP_COSTS[vcKey];
+    const row = INTERCON_LINE_COSTS[kind][vcKey] >= 0;
+    if (!row) return null;
+    const total = lc * f.distanceMi + tap;
+    return total >= 1e6 ? `~$${(total/1e6).toFixed(2)}M` : `~$${Math.round(total/1000)}K`;
+  };
+
+  if (loading) return (
+    <div style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0"}}>
+      <div style={{width:14,height:14,border:`2px solid ${T.blue}`,borderTop:"2px solid transparent",
+        borderRadius:"50%",animation:"spin 1s linear infinite"}}/>
+      <span style={{fontSize:11,color:T.tx3}}>Fetching nearby substations & lines…</span>
+    </div>
+  );
+
+  if (!features.length && !loading) return (
+    <div style={{fontSize:11,color:T.warn,padding:"6px 0"}}>
+      No HV infrastructure found within 25 miles. Check your project location in Forma.
+    </div>
+  );
+
+  return (
+    <div>
+      {/* Connection type toggle */}
+      <div style={{marginBottom:10}}>
+        <div style={{fontSize:11,fontWeight:500,color:T.tx2,marginBottom:5}}>Connection type</div>
+        <div style={{display:"flex",gap:6}}>
+          {([["overhead","Overhead line"],["underground","Underground cable"]] as const).map(([k,label])=>(
+            <button key={k} onClick={()=>handleKindChange(k)}
+              style={{flex:1,padding:"6px 8px",fontSize:11,fontWeight:kind===k?500:400,
+                color:kind===k?"#fff":T.tx2,
+                background:kind===k?T.blue:"#f7f7f7",
+                border:`1px solid ${kind===k?T.blue:T.border}`,borderRadius:4,cursor:"pointer",textAlign:"left"}}>
+              <div>{label}</div>
+              <div style={{fontSize:10,opacity:.8,marginTop:1}}>
+                {k==="overhead"?"Lower cost · requires ROW":"Higher cost · minimal ROW"}
+              </div>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Feature list */}
+      <div style={{fontSize:11,fontWeight:500,color:T.tx2,marginBottom:5}}>
+        Select connection point {features.length>0&&`(${features.length} found)`}
+      </div>
+      <div style={{display:"flex",flexDirection:"column",gap:4,maxHeight:280,overflowY:"auto"}}>
+        {features.map((f,i)=>{
+          const isSel = picked===f.name;
+          const cost  = previewCost(f);
+          return(
+            <div key={i} onClick={()=>handlePick(f)}
+              style={{display:"flex",alignItems:"flex-start",gap:8,padding:"7px 10px",
+                borderRadius:5,cursor:"pointer",
+                border:`1px solid ${isSel?T.blue:T.border}`,
+                background:isSel?T.blueLt:"#fafafa",transition:"all .12s"}}>
+              {/* Type icon */}
+              <div style={{width:28,height:28,borderRadius:4,flexShrink:0,
+                background:f.sourceType==="substation"?"#e8f5fc":"#fff0ed",
+                border:`1px solid ${f.sourceType==="substation"?T.blue:"#f0a090"}`,
+                display:"flex",alignItems:"center",justifyContent:"center",fontSize:14}}>
+                {f.sourceType==="substation"?"■":"〜"}
+              </div>
+              {/* Info */}
+              <div style={{flex:1,minWidth:0}}>
+                <div style={{fontSize:11,fontWeight:isSel?500:400,color:isSel?T.blue:T.tx1,
+                  overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{f.name}</div>
+                <div style={{fontSize:10,color:T.tx3,marginTop:1}}>
+                  {f.sourceType==="substation"?"Substation":"Trans. line"}
+                  {f.voltageKV && ` · ${f.voltageKV} kV`}
+                  {" · "}{f.distanceMi} mi
+                </div>
+              </div>
+              {/* Cost preview */}
+              {cost&&<div style={{fontSize:11,fontWeight:500,color:isSel?T.blue:T.tx2,flexShrink:0,whiteSpace:"nowrap"}}>{cost}</div>}
+              {/* Radio */}
+              <div style={{width:16,height:16,borderRadius:8,flexShrink:0,marginTop:2,
+                border:`1.5px solid ${isSel?T.blue:"#ccc"}`,background:isSel?T.blue:"#fff",
+                display:"flex",alignItems:"center",justifyContent:"center"}}>
+                {isSel&&<div style={{width:6,height:6,borderRadius:3,background:"#fff"}}/>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Clear selection */}
+      {selected && (
+        <button onClick={()=>{setPicked(null);onClear();}}
+          style={{marginTop:8,fontSize:11,color:T.red,background:"none",border:"none",
+            cursor:"pointer",padding:0,textDecoration:"underline"}}>
+          Remove grid connection from estimate
+        </button>
+      )}
+
+      {/* Selected summary */}
+      {selected&&(
+        <div style={{marginTop:8,padding:"8px 10px",background:T.greenLt,borderRadius:5,
+          border:`1px solid ${T.green}44`}}>
+          <div style={{fontSize:11,fontWeight:500,color:T.green,marginBottom:2}}>
+            ✓ {selected.name}
+          </div>
+          <div style={{fontSize:10,color:T.tx2}}>
+            {selected.distanceMi} mi · {selected.kind==="overhead"?"Overhead":"Underground"} ·
+            {" "}{selected.voltageKV ? selected.voltageKV+"kV" : "HV"} ·
+            ROW + tap included in BoM
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }

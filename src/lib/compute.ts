@@ -103,6 +103,42 @@ export type AuxEntry = {
   path?:      string;    // Forma element path
 };
 
+// ─── Grid interconnection ─────────────────────────────────────────────────────
+
+export type GridConnectionKind = "overhead" | "underground";
+export type GridSourceType     = "substation" | "line";
+
+export type GridConnection = {
+  name:       string;
+  sourceType: GridSourceType;
+  distanceMi: number;
+  kind:       GridConnectionKind;
+  voltageKV?: number;
+};
+
+// Interconnection line costs ($/mile, RSMeans 2024 Heavy Construction)
+// Overhead: pole/tower, conductor, ROW clearing, hardware
+// Underground: duct bank, cable, splices, restoration
+export const INTERCON_LINE_COSTS: Record<GridConnectionKind, Record<VCKey, number>> = {
+  overhead: {
+    dist:     285_000,   // 12–35 kV, wood pole distribution line
+    subtrans: 520_000,   // 69–138 kV, H-frame steel
+    trans:  1_850_000,   // 230–500 kV, lattice tower
+  },
+  underground: {
+    dist:   1_200_000,
+    subtrans: 2_800_000,
+    trans:  8_500_000,
+  },
+};
+
+// One-time tap/interconnection equipment at the connection point
+export const INTERCON_TAP_COSTS: Record<VCKey, number> = {
+  dist:     125_000,
+  subtrans: 285_000,
+  trans:    580_000,
+};
+
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 export type Config = {
@@ -117,6 +153,7 @@ export type Config = {
   cont:    number;
   sf:      number;
   auxStructures: AuxEntry[];
+  gridConnection?: GridConnection;
 };
 
 // ─── Line item & BoM types ────────────────────────────────────────────────────
@@ -334,6 +371,33 @@ export function computeBOM(c: Config): BOMResult {
         };
       }),
     });
+  }
+
+  // Grid interconnection (optional)
+  if (c.gridConnection) {
+    const gc  = c.gridConnection;
+    const lc  = INTERCON_LINE_COSTS[gc.kind][c.vc];
+    const tap = INTERCON_TAP_COSTS[c.vc];
+    sections.push({ name:"Grid Interconnection", items: mk([
+      {
+        desc: `${gc.kind==="overhead"?"Overhead":"Underground"} ${vc.sub} line extension to ${gc.name}`,
+        qty:  +gc.distanceMi.toFixed(2),
+        unit: "Mile",
+        u:    adj(lc),
+      },
+      {
+        desc: `Interconnection tap at ${gc.sourceType==="substation"?"existing substation":"transmission line"}`,
+        qty:  1,
+        unit: "LS",
+        u:    adj(tap),
+      },
+      {
+        desc: "ROW acquisition / easement (allowance)",
+        qty:  +gc.distanceMi.toFixed(2),
+        unit: "Mile",
+        u:    adj(gc.kind==="underground" ? 85_000 : 35_000),
+      },
+    ])});
   }
 
   const directSub = sections.reduce((s,sec)=>s+sec.items.reduce((ss,i)=>ss+i.total,0),0);
