@@ -182,7 +182,6 @@ async function pushSlopeTexture(Forma: any, opacity: number): Promise<void> {
     imgData.data[i]   = data[i];
     imgData.data[i+1] = data[i+1];
     imgData.data[i+2] = data[i+2];
-    // Only set alpha where pixels were drawn (original alpha > 0)
     imgData.data[i+3] = data[i+3] > 0 ? alpha : 0;
   }
   ctx.putImageData(imgData, 0, 0);
@@ -190,17 +189,13 @@ async function pushSlopeTexture(Forma: any, opacity: number): Promise<void> {
   const centerX = (minX + maxX) / 2;
   const centerY = (minY + maxY) / 2;
 
-  try {
-    await Forma.terrain.groundTexture.updateTextureData({ name: "slope-overlay", canvas });
-  } catch {
-    // updateTextureData fails if texture doesn't exist yet — add it instead
-    try { await Forma.terrain.groundTexture.remove({ name: "slope-overlay" }); } catch {}
-    await Forma.terrain.groundTexture.add({
-      name: "slope-overlay", canvas,
-      position: { x: centerX, y: centerY, z: 2 },
-      scale: { x: CELL, y: CELL },
-    });
-  }
+  // Always remove-then-add — updateTextureData is unreliable across SDK versions
+  try { await Forma.terrain.groundTexture.remove({ name: "slope-overlay" }); } catch {}
+  await Forma.terrain.groundTexture.add({
+    name: "slope-overlay", canvas,
+    position: { x: centerX, y: centerY, z: 2 },
+    scale: { x: CELL, y: CELL },
+  });
 }
 
 export async function removeSlopeOverlay(): Promise<void> {
@@ -436,6 +431,28 @@ export type InfraFeature = {
   coords?: [number, number][];
 };
 
+const OVERPASS_ENDPOINTS = [
+  "https://overpass-api.de/api/interpreter",
+  "https://overpass.kumi.systems/api/interpreter",
+];
+
+async function overpassFetch(query: string): Promise<any> {
+  const body = `data=${encodeURIComponent(query)}`;
+  const headers = { "Content-Type": "application/x-www-form-urlencoded" };
+  let lastErr: unknown;
+  for (const endpoint of OVERPASS_ENDPOINTS) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 20000);
+      const resp = await fetch(endpoint, { method: "POST", headers, body, signal: ctrl.signal });
+      clearTimeout(timer);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      return await resp.json();
+    } catch (e) { lastErr = e; }
+  }
+  throw lastErr;
+}
+
 export async function fetchPowerInfrastructure(
   lat: number, lon: number, radiusM = 40000,
   onProgress?: (msg: string) => void
@@ -454,12 +471,7 @@ export async function fetchPowerInfrastructure(
     out center;
   `;
 
-  const resp = await fetch("https://overpass-api.de/api/interpreter", {
-    method: "POST",
-    body: `data=${encodeURIComponent(query)}`,
-  });
-  if (!resp.ok) throw new Error(`OSM API error: ${resp.status}`);
-  const data = await resp.json();
+  const data = await overpassFetch(query);
 
   const features: InfraFeature[] = [];
   for (const el of data.elements ?? []) {
