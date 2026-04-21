@@ -830,51 +830,131 @@ function ParamInput({id,val,cfg,onSet,onSetVal}:{id:keyof Config;val:unknown;cfg
 
 // ─── Fetch nearby infrastructure from OSM ─────────────────────────────────────
 
-async function fetchNearbyInfra(
-  lat: number, lon: number, radiusM = 40000
-): Promise<{name:string;sourceType:GridSourceType;lat:number;lon:number;voltageKV?:number;distanceMi:number}[]> {
-  const query = `
-    [out:json][timeout:20];
-    (
-      node["power"="substation"]["voltage"~"^[1-9][0-9]{4,}"](around:${radiusM},${lat},${lon});
-      way["power"="substation"]["voltage"~"^[1-9][0-9]{4,}"](around:${radiusM},${lat},${lon});
-      way["power"="line"]["voltage"~"^[1-9][0-9]{4,}"](around:${radiusM},${lat},${lon});
-    );
-    out center;
-  `;
-  const resp = await fetch("https://overpass-api.de/api/interpreter", {
-    method: "POST",
-    body: `data=${encodeURIComponent(query)}`,
-  });
-  if (!resp.ok) throw new Error("OSM fetch failed");
-  const data = await resp.json();
+// HIFLD (Homeland Infrastructure Foundation-Level Data) — authoritative US
+// government dataset maintained by DHS / Oak Ridge National Laboratory.
+// Covers all HV substations (≥69kV) and transmission lines with proper
+// voltage data from actual utility records. Far more complete than OSM for US.
+const HIFLD_SUBSTATIONS = "https://services1.arcgis.com/Hp6G80Pky0om7QvQ/arcgis/rest/services/Electric_Power_Substations/FeatureServer/0/query";
+const HIFLD_TRANS_LINES  = "https://services1.arcgis.com/Hp6G80Pky0om7QvQ/arcgis/rest/services/Electric_Power_Transmission_Lines/FeatureServer/0/query";
 
-  const haversine = (la1:number,lo1:number,la2:number,lo2:number) => {
-    const R=3958.8, dr=((la2-la1)*Math.PI)/180, dc=((lo2-lo1)*Math.PI)/180;
-    const a=Math.sin(dr/2)**2+Math.cos(la1*Math.PI/180)*Math.cos(la2*Math.PI/180)*Math.sin(dc/2)**2;
-    return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
-  };
+const haversine = (la1:number,lo1:number,la2:number,lo2:number) => {
+  const R=3958.8, dr=((la2-la1)*Math.PI)/180, dc=((lo2-lo1)*Math.PI)/180;
+  const a=Math.sin(dr/2)**2+Math.cos(la1*Math.PI/180)*Math.cos(la2*Math.PI/180)*Math.sin(dc/2)**2;
+  return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+};
+
+async function fetchNearbyInfra(
+  lat: number, lon: number, radiusMi = 25
+): Promise<{name:string;sourceType:GridSourceType;lat:number;lon:number;voltageKV?:number;distanceMi:number}[]> {
+
+  // Bounding box: ±(radiusMi/69) degrees lat, ±(radiusMi/53) degrees lon
+  const dLat = radiusMi / 69;
+  const dLon = radiusMi / (Math.cos(lat * Math.PI / 180) * 69);
+  const bbox  = `${lon-dLon},${lat-dLat},${lon+dLon},${lat+dLat}`;
+  const common = `&geometryType=esriGeometryEnvelope&inSR=4326&spatialRel=esriSpatialRelIntersects&returnGeometry=true&outSR=4326&f=geojson&resultRecordCount=100`;
 
   const features: {name:string;sourceType:GridSourceType;lat:number;lon:number;voltageKV?:number;distanceMi:number}[] = [];
-  for (const el of data.elements ?? []) {
-    const clat = el.lat ?? el.center?.lat;
-    const clon = el.lon ?? el.center?.lon;
-    if (!clat || !clon) continue;
-    const tags = el.tags ?? {};
-    const power = tags.power;
-    const rawV  = parseInt(tags.voltage ?? "0");
-    const voltageKV = rawV >= 1000 ? rawV / 1000 : rawV || undefined;
-    const distanceMi = Math.round(haversine(lat, lon, clat, clon) * 10) / 10;
-    const name = tags.name || (power==="substation"
-      ? `${voltageKV ? voltageKV+"kV " : ""}Substation`
-      : `${voltageKV ? voltageKV+"kV " : ""}Transmission Line`);
-    features.push({
-      name,
-      sourceType: power==="substation" ? "substation" : "line",
-      lat: clat, lon: clon, voltageKV, distanceMi,
-    });
+
+  // ── Substations from HIFLD ─────────────────────────────────────────────────
+  try {
+    const url = `${HIFLD_SUBSTATIONS}?where=STATUS%3D'IN SERVICE'&geometry=${encodeURIComponent(bbox)}&outFields=NAME,CITY,STATE,VOLT_CLASS,MAX_VOLT${common}`;
+    const resp = await fetch(url);
+    if (resp.ok) {
+      const data = await resp.json();
+      for (const f of data.features ?? []) {
+        const p   = f.properties ?? {};
+        const geo = f.geometry;
+        // Centroid for polygons, direct for points
+        let clat: number, clon: number;
+        if (geo.type === "Point") {
+          [clon, clat] = geo.coordinates;
+        } else if (geo.type === "Polygon") {
+          const coords = geo.coordinates[0];
+          clon = coords.reduce((s:[number,number], c:[number,number]) => [s[0]+c[0], s[1]+c[1]] as [number,number], [0,0])[0] / coords.length;
+          clat = coords.reduce((s:[number,number], c:[number,number]) => [s[0]+c[0], s[1]+c[1]] as [number,number], [0,0])[1] / coords.length;
+        } else continue;
+
+        const maxV    = parseInt(p.MAX_VOLT ?? "0");
+        const voltageKV = maxV > 0 ? maxV : undefined;
+        if (voltageKV && voltageKV < 69) continue; // skip distribution-only subs
+        const distanceMi = Math.round(haversine(lat, lon, clat, clon) * 10) / 10;
+        const name = [p.NAME, p.CITY && `(${p.CITY})`, voltageKV && `${voltageKV}kV`]
+          .filter(Boolean).join(" ") || "HV Substation";
+        features.push({ name, sourceType:"substation", lat:clat, lon:clon, voltageKV, distanceMi });
+      }
+    }
+  } catch { /* fall through to OSM */ }
+
+  // ── Transmission lines from HIFLD ─────────────────────────────────────────
+  try {
+    const url = `${HIFLD_TRANS_LINES}?where=STATUS%3D'IN SERVICE'&geometry=${encodeURIComponent(bbox)}&outFields=VOLTAGE,TYPE,OWNER,ID${common}`;
+    const resp = await fetch(url);
+    if (resp.ok) {
+      const data = await resp.json();
+      const seen = new Set<string>();
+      for (const f of data.features ?? []) {
+        const p   = f.properties ?? {};
+        const geo = f.geometry;
+        if (geo.type !== "LineString" && geo.type !== "MultiLineString") continue;
+
+        // Deduplicate by voltage+owner combo (avoid listing every segment)
+        const key = `${p.VOLTAGE ?? ""}|${p.OWNER ?? ""}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        // Find closest point on the line to the project
+        const coords: [number,number][] = geo.type === "LineString"
+          ? geo.coordinates
+          : geo.coordinates.flat();
+        if (!coords.length) continue;
+
+        let minDist = Infinity, bestLat = 0, bestLon = 0;
+        for (const [clon, clat] of coords) {
+          const d = haversine(lat, lon, clat, clon);
+          if (d < minDist) { minDist = d; bestLat = clat; bestLon = clon; }
+        }
+
+        const rawV = parseInt(p.VOLTAGE ?? "0");
+        const voltageKV = rawV >= 1000 ? rawV / 1000 : rawV > 0 ? rawV : undefined;
+        const distanceMi = Math.round(minDist * 10) / 10;
+        const name = [voltageKV && `${voltageKV}kV`, "Transmission Line",
+          p.OWNER && `(${String(p.OWNER).substring(0,20)})`].filter(Boolean).join(" ");
+        features.push({ name, sourceType:"line", lat:bestLat, lon:bestLon, voltageKV, distanceMi });
+      }
+    }
+  } catch { /* fall through */ }
+
+  // ── Fallback: OSM with relaxed filter if HIFLD returned nothing ───────────
+  if (features.length === 0) {
+    try {
+      const radiusM = radiusMi * 1609.34;
+      const query = `[out:json][timeout:20];
+        (node["power"="substation"](around:${radiusM},${lat},${lon});
+         way["power"="substation"](around:${radiusM},${lat},${lon});
+         way["power"="line"]["voltage"~"^[0-9]"](around:${radiusM},${lat},${lon});
+        );out center;`;
+      const resp = await fetch("https://overpass-api.de/api/interpreter",
+        { method:"POST", body:`data=${encodeURIComponent(query)}` });
+      if (resp.ok) {
+        const data = await resp.json();
+        for (const el of data.elements ?? []) {
+          const clat = el.lat ?? el.center?.lat;
+          const clon = el.lon ?? el.center?.lon;
+          if (!clat || !clon) continue;
+          const tags = el.tags ?? {};
+          const rawV = parseInt(tags.voltage ?? "0");
+          const voltageKV = rawV >= 1000 ? rawV/1000 : rawV || undefined;
+          const distanceMi = Math.round(haversine(lat, lon, clat, clon) * 10) / 10;
+          features.push({
+            name: tags.name || (tags.power==="substation" ? `${voltageKV?voltageKV+"kV ":""}Substation` : `${voltageKV?voltageKV+"kV ":""}Line`),
+            sourceType: tags.power==="substation" ? "substation" : "line",
+            lat:clat, lon:clon, voltageKV, distanceMi,
+          });
+        }
+      }
+    } catch { /* give up */ }
   }
-  // Sort by distance, cap at 30
+
   return features.sort((a,b)=>a.distanceMi-b.distanceMi).slice(0,30);
 }
 
