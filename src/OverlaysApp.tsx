@@ -178,12 +178,11 @@ export default function OverlaysApp() {
   };
 
   return (
-    <div style={{display:"flex",flexDirection:"column",height:"100vh",background:"#fff",
-      fontFamily:"'Inter',system-ui,sans-serif",overflow:"hidden"}}>
+    <div style={{background:"#fff",fontFamily:"'Inter',system-ui,sans-serif",minHeight:"100%"}}>
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
 
       {/* Header */}
-      <div style={{padding:"14px 16px 12px",borderBottom:`1px solid ${T.border}`,flexShrink:0}}>
+      <div style={{padding:"14px 16px 12px",borderBottom:`1px solid ${T.border}`}}>
         <div style={{fontSize:14,fontWeight:600,color:T.tx1,lineHeight:1}}>Site Overlays</div>
         <div style={{fontSize:11,color:T.tx3,marginTop:3}}>
           Terrain analysis · Power infrastructure
@@ -191,7 +190,7 @@ export default function OverlaysApp() {
         </div>
       </div>
 
-      <div style={{flex:1,overflowY:"auto",padding:"12px 16px",display:"flex",flexDirection:"column",gap:12}}>
+      <div style={{padding:"12px 16px",display:"flex",flexDirection:"column",gap:12}}>
 
         {/* ── Slope Overlay ────────────────────────────────────────────── */}
         <OverlayCard
