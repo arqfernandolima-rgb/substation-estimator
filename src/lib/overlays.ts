@@ -57,14 +57,21 @@ async function getTerrainData(): Promise<TerrainCache> {
   return terrainCache;
 }
 
-export function clearTerrainCache() { terrainCache = null; }
+// ─── Slope mesh cache ─────────────────────────────────────────────────────────
+// groundTexture renders below Forma's native layers (satellite, topo contours).
+// Forma.render.addMesh renders above all layers — used here instead.
 
-// ─── Cached raw slope pixel data (no alpha applied) ───────────────────────────
-// Stored so opacity changes re-use the same render without new API calls.
+type SlopeMeshCache = {
+  positions: Float32Array;
+  slopePerVertex: Float32Array;
+  meshId: string | null;
+};
 
-let slopePixelCache: { data: Uint8ClampedArray; cols: number; rows: number } | null = null;
+let slopeMeshCache: SlopeMeshCache | null = null;
 
-// ─── Slope overlay render ────────────────────────────────────────────────────
+export function clearTerrainCache() { terrainCache = null; slopeMeshCache = null; }
+
+// ─── Slope overlay render (Gouraud mesh) ─────────────────────────────────────
 
 export async function renderSlopeOverlay(
   onProgress: (msg: string) => void,
@@ -72,149 +79,110 @@ export async function renderSlopeOverlay(
 ): Promise<void> {
   const { Forma } = await import("forma-embedded-view-sdk/auto");
 
-  if (!slopePixelCache) {
+  if (!slopeMeshCache) {
     onProgress("Reading terrain mesh…");
-    const terrain = await getTerrainData();
-    onProgress("Computing slope from triangle normals…");
+    const { triangles } = await getTerrainData();
+    onProgress("Computing slope…");
 
-    const { triangles, minX, maxX, minY, maxY } = terrain;
-    const W = maxX - minX, H = maxY - minY;
-    const CELL = 2; // 2 m/px — fine enough to resolve individual slopes
-    const cols = Math.ceil(W / CELL) + 2;
-    const rows = Math.ceil(H / CELL) + 2;
+    // Pass 1: compute face slope and accumulate per vertex (Gouraud averaging)
+    const vkey = (x: number, y: number, z: number) =>
+      `${x.toFixed(1)},${y.toFixed(1)},${z.toFixed(1)}`;
 
-    // World → canvas pixel (Y is flipped: canvas Y=0 is world north = high Y)
-    const toPx = (wx: number, wy: number): [number, number] => [
-      Math.round((wx - minX) / CELL),
-      Math.round(rows - (wy - minY) / CELL),
-    ];
-
-    // Phase 1: render each triangle as a normalized grayscale slope value
-    // gray 0 = 0% slope, gray 255 = ≥30% slope
-    const grayCanvas = document.createElement("canvas");
-    grayCanvas.width = cols; grayCanvas.height = rows;
-    const gCtx = grayCanvas.getContext("2d")!;
+    const vertexAcc = new Map<string, { sum: number; n: number }>();
+    const faceSlopes: number[] = [];
 
     for (let i = 0; i < triangles.length; i += 9) {
-      const x1 = triangles[i],   y1 = triangles[i+1], z1 = triangles[i+2];
-      const x2 = triangles[i+3], y2 = triangles[i+4], z2 = triangles[i+5];
-      const x3 = triangles[i+6], y3 = triangles[i+7], z3 = triangles[i+8];
+      const x1=triangles[i],   y1=triangles[i+1], z1=triangles[i+2];
+      const x2=triangles[i+3], y2=triangles[i+4], z2=triangles[i+5];
+      const x3=triangles[i+6], y3=triangles[i+7], z3=triangles[i+8];
 
-      const ex1 = x2-x1, ey1 = y2-y1, ez1 = z2-z1;
-      const ex2 = x3-x1, ey2 = y3-y1, ez2 = z3-z1;
-      const nx  = ey1*ez2 - ez1*ey2;
-      const ny  = ez1*ex2 - ex1*ez2;
-      const nz  = ex1*ey2 - ey1*ex2;
+      const ex1=x2-x1, ey1=y2-y1, ez1=z2-z1;
+      const ex2=x3-x1, ey2=y3-y1, ez2=z3-z1;
+      const nx = ey1*ez2 - ez1*ey2;
+      const ny = ez1*ex2 - ex1*ez2;
+      const nz = ex1*ey2 - ey1*ex2;
       const nLen = Math.sqrt(nx*nx + ny*ny + nz*nz);
-      if (nLen < 1e-10) continue;
 
+      if (nLen < 1e-10) { faceSlopes.push(-1); continue; }
       const cosAngle = Math.abs(nz) / nLen;
-      if (cosAngle < 0.2) continue;
+      if (cosAngle < 0.2) { faceSlopes.push(-1); continue; }
 
-      const sinAngle = Math.sqrt(1 - cosAngle * cosAngle);
-      const slopePct = (sinAngle / cosAngle) * 100;
+      const slopePct = (Math.sqrt(1 - cosAngle*cosAngle) / cosAngle) * 100;
+      faceSlopes.push(slopePct);
 
-      const [px1, py1] = toPx(x1, y1);
-      const [px2, py2] = toPx(x2, y2);
-      const [px3, py3] = toPx(x3, y3);
-
-      // Encode slope 0–30% as gray 0–255 (clamp above 30%)
-      const g = Math.round(Math.min(slopePct / 30, 1) * 255);
-      gCtx.fillStyle = `rgb(${g},${g},${g})`;
-      gCtx.beginPath();
-      gCtx.moveTo(px1, py1);
-      gCtx.lineTo(px2, py2);
-      gCtx.lineTo(px3, py3);
-      gCtx.closePath();
-      gCtx.fill();
+      for (const [vx,vy,vz] of [[x1,y1,z1],[x2,y2,z2],[x3,y3,z3]]) {
+        const k = vkey(vx, vy, vz);
+        const e = vertexAcc.get(k);
+        if (e) { e.sum += slopePct; e.n++; }
+        else vertexAcc.set(k, { sum: slopePct, n: 1 });
+      }
     }
 
-    onProgress("Smoothing…");
+    // Pass 2: build position + per-vertex slope arrays (skip wall faces)
+    const positions: number[] = [];
+    const slopes: number[] = [];
 
-    // Phase 2: Gaussian blur turns hard triangle edges into gradual transitions
-    const blurCanvas = document.createElement("canvas");
-    blurCanvas.width = cols; blurCanvas.height = rows;
-    const blurCtx = blurCanvas.getContext("2d")!;
-    blurCtx.filter = "blur(6px)";
-    blurCtx.drawImage(grayCanvas, 0, 0);
-    blurCtx.filter = "none";
-
-    // Phase 3: remap blurred gray → band RGB via LUT (0–30% range)
-    const LUT = new Uint8Array(256 * 3);
-    for (let g = 0; g < 256; g++) {
-      const band = SLOPE_BANDS.find(b => (g / 255) * 30 <= b.max) ?? SLOPE_BANDS[SLOPE_BANDS.length - 1];
-      LUT[g*3] = band.rgb[0]; LUT[g*3+1] = band.rgb[1]; LUT[g*3+2] = band.rgb[2];
+    for (let fi = 0, i = 0; fi < faceSlopes.length; fi++, i += 9) {
+      if (faceSlopes[fi] < 0) continue;
+      const x1=triangles[i],   y1=triangles[i+1], z1=triangles[i+2];
+      const x2=triangles[i+3], y2=triangles[i+4], z2=triangles[i+5];
+      const x3=triangles[i+6], y3=triangles[i+7], z3=triangles[i+8];
+      for (const [vx,vy,vz] of [[x1,y1,z1],[x2,y2,z2],[x3,y3,z3]]) {
+        positions.push(vx, vy, vz);
+        const e = vertexAcc.get(vkey(vx,vy,vz))!;
+        slopes.push(e.sum / e.n);
+      }
     }
 
-    const blurData = blurCtx.getImageData(0, 0, cols, rows);
-    const colorData = new Uint8ClampedArray(cols * rows * 4);
-    for (let i = 0; i < blurData.data.length; i += 4) {
-      if (blurData.data[i+3] === 0) continue;
-      const g3 = blurData.data[i] * 3;
-      colorData[i] = LUT[g3]; colorData[i+1] = LUT[g3+1]; colorData[i+2] = LUT[g3+2];
-      colorData[i+3] = 255;
-    }
-
-    slopePixelCache = { data: colorData, cols, rows };
-    (slopePixelCache as any).minX = minX;
-    (slopePixelCache as any).maxX = maxX;
-    (slopePixelCache as any).minY = minY;
-    (slopePixelCache as any).maxY = maxY;
-    (slopePixelCache as any).CELL = CELL;
+    slopeMeshCache = {
+      positions: new Float32Array(positions),
+      slopePerVertex: new Float32Array(slopes),
+      meshId: null,
+    };
   }
 
-  onProgress("Applying overlay…");
-  await pushSlopeTexture(Forma, opacity);
+  onProgress("Rendering…");
+  await pushSlopeMesh(Forma, opacity);
   onProgress("done");
 }
 
-// Apply (or re-apply) opacity to cached slope pixel data → groundTexture
-export async function updateSlopeOpacity(opacity: number): Promise<void> {
-  if (!slopePixelCache) return;
-  const { Forma } = await import("forma-embedded-view-sdk/auto");
-  await pushSlopeTexture(Forma, opacity);
+async function pushSlopeMesh(Forma: any, opacity: number): Promise<void> {
+  if (!slopeMeshCache) return;
+  const { positions, slopePerVertex } = slopeMeshCache;
+  const alpha = Math.round(opacity * 255);
+
+  const colors = new Uint8Array(slopePerVertex.length * 4);
+  for (let i = 0; i < slopePerVertex.length; i++) {
+    const band = SLOPE_BANDS.find(b => slopePerVertex[i] <= b.max) ?? SLOPE_BANDS[SLOPE_BANDS.length - 1];
+    colors[i*4]   = band.rgb[0];
+    colors[i*4+1] = band.rgb[1];
+    colors[i*4+2] = band.rgb[2];
+    colors[i*4+3] = alpha;
+  }
+
+  const geometryData = { position: positions, color: colors };
+
+  if (slopeMeshCache.meshId) {
+    await Forma.render.updateMesh({ id: slopeMeshCache.meshId, geometryData });
+  } else {
+    const { id } = await Forma.render.addMesh({ geometryData });
+    slopeMeshCache.meshId = id;
+  }
 }
 
-async function pushSlopeTexture(Forma: any, opacity: number): Promise<void> {
-  if (!slopePixelCache) return;
-  const { data, cols, rows } = slopePixelCache;
-  const c  = (slopePixelCache as any);
-  const CELL  = c.CELL;
-  const minX  = c.minX, maxX = c.maxX;
-  const minY  = c.minY, maxY = c.maxY;
-
-  // Apply opacity to a copy of the raw pixel data
-  const canvas = document.createElement("canvas");
-  canvas.width  = cols;
-  canvas.height = rows;
-  const ctx     = canvas.getContext("2d")!;
-  const imgData = ctx.createImageData(cols, rows);
-  const alpha   = Math.round(opacity * 255);
-
-  for (let i = 0; i < data.length; i += 4) {
-    imgData.data[i]   = data[i];
-    imgData.data[i+1] = data[i+1];
-    imgData.data[i+2] = data[i+2];
-    imgData.data[i+3] = data[i+3] > 0 ? alpha : 0;
-  }
-  ctx.putImageData(imgData, 0, 0);
-
-  const centerX = (minX + maxX) / 2;
-  const centerY = (minY + maxY) / 2;
-
-  // Always remove-then-add — updateTextureData is unreliable across SDK versions
-  try { await Forma.terrain.groundTexture.remove({ name: "slope-overlay" }); } catch {}
-  await Forma.terrain.groundTexture.add({
-    name: "slope-overlay", canvas,
-    position: { x: centerX, y: centerY, z: 2 },
-    scale: { x: CELL, y: CELL },
-  });
+export async function updateSlopeOpacity(opacity: number): Promise<void> {
+  if (!slopeMeshCache?.meshId) return;
+  const { Forma } = await import("forma-embedded-view-sdk/auto");
+  await pushSlopeMesh(Forma, opacity);
 }
 
 export async function removeSlopeOverlay(): Promise<void> {
-  slopePixelCache = null;
   const { Forma } = await import("forma-embedded-view-sdk/auto");
-  try { await Forma.terrain.groundTexture.remove({ name: "slope-overlay" }); } catch {}
+  if (slopeMeshCache?.meshId) {
+    try { await Forma.render.remove({ id: slopeMeshCache.meshId }); } catch {}
+    slopeMeshCache.meshId = null;
+  }
+  slopeMeshCache = null;
 }
 
 // ─── Contour / topo lines overlay ────────────────────────────────────────────
