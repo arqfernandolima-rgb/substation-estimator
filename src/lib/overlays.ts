@@ -128,7 +128,7 @@ export async function renderSlopeOverlay(
       const x2=triangles[i+3], y2=triangles[i+4], z2=triangles[i+5];
       const x3=triangles[i+6], y3=triangles[i+7], z3=triangles[i+8];
       for (const [vx,vy,vz] of [[x1,y1,z1],[x2,y2,z2],[x3,y3,z3]]) {
-        positions.push(vx, vy, vz);
+        positions.push(vx, vy, vz + 0.5); // 0.5m lift prevents Z-fighting with terrain mesh
         const e = vertexAcc.get(vkey(vx,vy,vz))!;
         slopes.push(e.sum / e.n);
       }
