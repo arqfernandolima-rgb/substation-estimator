@@ -72,12 +72,9 @@ export async function renderSlopeOverlay(
 ): Promise<void> {
   const { Forma } = await import("forma-embedded-view-sdk/auto");
 
-  let terrain: TerrainCache;
-
   if (!slopePixelCache) {
-    // First render — fetch terrain and compute slope triangles
     onProgress("Reading terrain mesh…");
-    terrain = await getTerrainData();
+    const terrain = await getTerrainData();
     onProgress("Computing slope from triangle normals…");
 
     const { triangles, minX, maxX, minY, maxY } = terrain;
@@ -92,62 +89,78 @@ export async function renderSlopeOverlay(
       Math.round(rows - (wy - minY) / CELL),
     ];
 
-    const canvas = document.createElement("canvas");
-    canvas.width  = cols;
-    canvas.height = rows;
-    const ctx = canvas.getContext("2d")!;
+    // Phase 1: render each triangle as a normalized grayscale slope value
+    // gray 0 = 0% slope, gray 255 = ≥30% slope
+    const grayCanvas = document.createElement("canvas");
+    grayCanvas.width = cols; grayCanvas.height = rows;
+    const gCtx = grayCanvas.getContext("2d")!;
 
-    // Draw each terrain triangle with its face-normal slope color
     for (let i = 0; i < triangles.length; i += 9) {
       const x1 = triangles[i],   y1 = triangles[i+1], z1 = triangles[i+2];
       const x2 = triangles[i+3], y2 = triangles[i+4], z2 = triangles[i+5];
       const x3 = triangles[i+6], y3 = triangles[i+7], z3 = triangles[i+8];
 
-      // Cross product → face normal
       const ex1 = x2-x1, ey1 = y2-y1, ez1 = z2-z1;
       const ex2 = x3-x1, ey2 = y3-y1, ez2 = z3-z1;
       const nx  = ey1*ez2 - ez1*ey2;
       const ny  = ez1*ex2 - ex1*ez2;
       const nz  = ex1*ey2 - ey1*ex2;
       const nLen = Math.sqrt(nx*nx + ny*ny + nz*nz);
-
       if (nLen < 1e-10) continue;
 
-      // Skip wall triangles: |nz/nLen| < 0.2 means > ~78° tilt — not ground surface
       const cosAngle = Math.abs(nz) / nLen;
       if (cosAngle < 0.2) continue;
 
-      // slope% = tan(arccos(cosAngle)) × 100 = sinAngle/cosAngle × 100
       const sinAngle = Math.sqrt(1 - cosAngle * cosAngle);
       const slopePct = (sinAngle / cosAngle) * 100;
-
-      const band = SLOPE_BANDS.find(b => slopePct <= b.max) ?? SLOPE_BANDS[SLOPE_BANDS.length - 1];
 
       const [px1, py1] = toPx(x1, y1);
       const [px2, py2] = toPx(x2, y2);
       const [px3, py3] = toPx(x3, y3);
 
-      ctx.fillStyle = band.color;
-      ctx.beginPath();
-      ctx.moveTo(px1, py1);
-      ctx.lineTo(px2, py2);
-      ctx.lineTo(px3, py3);
-      ctx.closePath();
-      ctx.fill();
+      // Encode slope 0–30% as gray 0–255 (clamp above 30%)
+      const g = Math.round(Math.min(slopePct / 30, 1) * 255);
+      gCtx.fillStyle = `rgb(${g},${g},${g})`;
+      gCtx.beginPath();
+      gCtx.moveTo(px1, py1);
+      gCtx.lineTo(px2, py2);
+      gCtx.lineTo(px3, py3);
+      gCtx.closePath();
+      gCtx.fill();
     }
 
-    // Cache raw pixel data (no alpha applied yet)
-    const imgData = ctx.getImageData(0, 0, cols, rows);
-    slopePixelCache = { data: imgData.data.slice(), cols, rows };
+    onProgress("Smoothing…");
 
-    // Store terrain bounds on the cache for groundTexture positioning
+    // Phase 2: Gaussian blur turns hard triangle edges into gradual transitions
+    const blurCanvas = document.createElement("canvas");
+    blurCanvas.width = cols; blurCanvas.height = rows;
+    const blurCtx = blurCanvas.getContext("2d")!;
+    blurCtx.filter = "blur(6px)";
+    blurCtx.drawImage(grayCanvas, 0, 0);
+    blurCtx.filter = "none";
+
+    // Phase 3: remap blurred gray → band RGB via LUT (0–30% range)
+    const LUT = new Uint8Array(256 * 3);
+    for (let g = 0; g < 256; g++) {
+      const band = SLOPE_BANDS.find(b => (g / 255) * 30 <= b.max) ?? SLOPE_BANDS[SLOPE_BANDS.length - 1];
+      LUT[g*3] = band.rgb[0]; LUT[g*3+1] = band.rgb[1]; LUT[g*3+2] = band.rgb[2];
+    }
+
+    const blurData = blurCtx.getImageData(0, 0, cols, rows);
+    const colorData = new Uint8ClampedArray(cols * rows * 4);
+    for (let i = 0; i < blurData.data.length; i += 4) {
+      if (blurData.data[i+3] === 0) continue;
+      const g3 = blurData.data[i] * 3;
+      colorData[i] = LUT[g3]; colorData[i+1] = LUT[g3+1]; colorData[i+2] = LUT[g3+2];
+      colorData[i+3] = 255;
+    }
+
+    slopePixelCache = { data: colorData, cols, rows };
     (slopePixelCache as any).minX = minX;
     (slopePixelCache as any).maxX = maxX;
     (slopePixelCache as any).minY = minY;
     (slopePixelCache as any).maxY = maxY;
     (slopePixelCache as any).CELL = CELL;
-  } else {
-    terrain = await getTerrainData();
   }
 
   onProgress("Applying overlay…");
@@ -431,6 +444,89 @@ export type InfraFeature = {
   coords?: [number, number][];
 };
 
+// ─── HIFLD (primary) ─────────────────────────────────────────────────────────
+
+const HIFLD = "https://services1.arcgis.com/Hp6G80Pky0om7QvQ/arcgis/rest/services";
+
+async function hifldQuery(service: string, bboxParam: string, fields: string): Promise<any> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 30000);
+  const url = `${HIFLD}/${service}/FeatureServer/0/query?` +
+    `geometry=${bboxParam}&geometryType=esriGeometryEnvelope&inSR=4326` +
+    `&spatialRel=esriSpatialRelIntersects&outFields=${fields}` +
+    `&returnGeometry=true&outSR=4326&f=json`;
+  try {
+    const resp = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(timer);
+    if (!resp.ok) throw new Error(`HIFLD HTTP ${resp.status}`);
+    const json = await resp.json();
+    if (json.error) throw new Error(`HIFLD: ${json.error.message}`);
+    return json;
+  } catch (e) { clearTimeout(timer); throw e; }
+}
+
+async function fetchHIFLDPower(
+  lat: number, lon: number, radiusM: number,
+  onProgress?: (msg: string) => void
+): Promise<InfraFeature[]> {
+  const latD = radiusM / 111320;
+  const lonD = radiusM / (111320 * Math.cos(lat * Math.PI / 180));
+  const bboxParam = encodeURIComponent(JSON.stringify({
+    xmin: lon - lonD, ymin: lat - latD, xmax: lon + lonD, ymax: lat + latD,
+  }));
+
+  onProgress?.("Querying HIFLD power infrastructure…");
+  const [subData, lineData, plantData] = await Promise.all([
+    hifldQuery("Electric_Substations",            bboxParam, "NAME,VOLTAGE,TYPE"),
+    hifldQuery("Electric_Power_Transmission_Lines", bboxParam, "VOLTAGE,NAME"),
+    hifldQuery("Power_Plants",                    bboxParam, "NAME,PRIMSOURCE"),
+  ]);
+
+  const features: InfraFeature[] = [];
+
+  for (const f of subData.features ?? []) {
+    const g = f.geometry;
+    if (!g?.x) continue;
+    const kv = parseFloat(f.attributes?.VOLTAGE ?? "");
+    features.push({
+      type: "substation",
+      name: f.attributes?.NAME || (kv ? `${kv}kV Substation` : "Substation"),
+      lat: g.y, lon: g.x,
+      voltage: kv ? String(Math.round(kv * 1000)) : "",
+    });
+  }
+
+  for (const f of lineData.features ?? []) {
+    const paths: number[][][] = f.geometry?.paths ?? [];
+    if (!paths.length || paths[0].length < 2) continue;
+    const path = paths[0];
+    const mid  = path[Math.floor(path.length / 2)];
+    const kv   = parseFloat(f.attributes?.VOLTAGE ?? "");
+    features.push({
+      type: "line",
+      name: f.attributes?.NAME || (kv ? `${kv}kV Transmission` : "Transmission line"),
+      lat: mid[1], lon: mid[0],
+      voltage: kv ? String(Math.round(kv * 1000)) : "",
+      coords: path.map((pt: number[]) => [pt[1], pt[0]] as [number, number]),
+    });
+  }
+
+  for (const f of plantData.features ?? []) {
+    const g = f.geometry;
+    if (!g?.x) continue;
+    features.push({
+      type: "plant",
+      name: f.attributes?.NAME || "Power plant",
+      lat: g.y, lon: g.x,
+      fuel: f.attributes?.PRIMSOURCE ?? "",
+    });
+  }
+
+  return features;
+}
+
+// ─── OSM Overpass (fallback) ──────────────────────────────────────────────────
+
 const OVERPASS_ENDPOINTS = [
   "https://overpass-api.de/api/interpreter",
   "https://overpass.kumi.systems/api/interpreter",
@@ -443,7 +539,7 @@ async function overpassFetch(query: string): Promise<any> {
   for (const endpoint of OVERPASS_ENDPOINTS) {
     try {
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 20000);
+      const timer = setTimeout(() => ctrl.abort(), 30000);
       const resp = await fetch(endpoint, { method: "POST", headers, body, signal: ctrl.signal });
       clearTimeout(timer);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -453,12 +549,11 @@ async function overpassFetch(query: string): Promise<any> {
   throw lastErr;
 }
 
-export async function fetchPowerInfrastructure(
-  lat: number, lon: number, radiusM = 40000,
+async function fetchOSMPower(
+  lat: number, lon: number, radiusM: number,
   onProgress?: (msg: string) => void
 ): Promise<InfraFeature[]> {
-  onProgress?.("Querying OpenStreetMap power infrastructure…");
-
+  onProgress?.("Querying OpenStreetMap (fallback)…");
   const query = `
     [out:json][timeout:25];
     (
@@ -468,34 +563,44 @@ export async function fetchPowerInfrastructure(
       way["power"="plant"](around:${radiusM},${lat},${lon});
       way["power"="line"]["voltage"~"^[1-9][0-9]{4,}"](around:${radiusM},${lat},${lon});
     );
-    out center;
+    out center geom;
   `;
-
   const data = await overpassFetch(query);
-
   const features: InfraFeature[] = [];
   for (const el of data.elements ?? []) {
     const clat = el.lat ?? el.center?.lat;
     const clon = el.lon ?? el.center?.lon;
     if (!clat || !clon) continue;
-    const tags  = el.tags ?? {};
-    const power = tags.power;
-    const name  = tags.name || tags["name:en"] || "";
+    const tags    = el.tags ?? {};
+    const power   = tags.power;
+    const name    = tags.name || tags["name:en"] || "";
     const voltage = tags.voltage ?? "";
-
     if (power === "substation") {
       features.push({ type:"substation", name: name || `Substation (${voltage?voltage+"V":"HV"})`, lat:clat, lon:clon, voltage });
     } else if (power === "plant") {
       features.push({ type:"plant", name: name || "Power plant", lat:clat, lon:clon, fuel: tags.generator ?? tags["plant:source"] ?? "" });
     } else if (power === "line" && el.geometry) {
       const coords: [number,number][] = el.geometry.map((n:{lat:number;lon:number}) => [n.lat, n.lon] as [number,number]);
-      if (coords.length >= 2) {
-        features.push({ type:"line", name: name || `${voltage?voltage+"V ":""}Transmission line`, lat:clat, lon:clon, voltage, coords });
-      }
+      if (coords.length >= 2) features.push({ type:"line", name: name || `${voltage?voltage+"V ":""}Transmission line`, lat:clat, lon:clon, voltage, coords });
     }
   }
-  onProgress?.(`Found ${features.filter(f=>f.type==="substation").length} substations, ${features.filter(f=>f.type==="plant").length} plants, ${features.filter(f=>f.type==="line").length} lines`);
   return features;
+}
+
+export async function fetchPowerInfrastructure(
+  lat: number, lon: number, radiusM = 40000,
+  onProgress?: (msg: string) => void
+): Promise<InfraFeature[]> {
+  try {
+    const features = await fetchHIFLDPower(lat, lon, radiusM, onProgress);
+    onProgress?.(`Found ${features.filter(f=>f.type==="substation").length} substations, ${features.filter(f=>f.type==="plant").length} plants, ${features.filter(f=>f.type==="line").length} lines`);
+    return features;
+  } catch {
+    onProgress?.("HIFLD unavailable, trying OpenStreetMap…");
+    const features = await fetchOSMPower(lat, lon, radiusM, onProgress);
+    onProgress?.(`Found ${features.filter(f=>f.type==="substation").length} substations, ${features.filter(f=>f.type==="plant").length} plants, ${features.filter(f=>f.type==="line").length} lines`);
+    return features;
+  }
 }
 
 function latLonToLocal(lat:number,lon:number,refLat:number,refLon:number):[number,number] {
