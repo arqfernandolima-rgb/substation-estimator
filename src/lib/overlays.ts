@@ -401,6 +401,10 @@ export async function removeTopoOverlay(): Promise<void> {
 }
 
 // ─── Power infrastructure overlay ────────────────────────────────────────────
+// Uses Forma.render.addMesh (same as slope) so it renders above native layers.
+// groundTexture.add() renders below satellite/topo and was the original bug.
+
+let powerMeshCache: { meshId: string | null } | null = null;
 
 export type InfraFeature = {
   type:    "substation" | "plant" | "line";
@@ -587,89 +591,97 @@ function latLonToLocal(lat:number,lon:number,refLat:number,refLon:number):[numbe
 }
 
 export async function renderPowerOverlay(
-  features: InfraFeature[], refLat:number, refLon:number,
+  features: InfraFeature[], refLat: number, refLon: number,
   visibleTypes: Set<"substation"|"plant"|"line">,
-  onProgress:(msg:string)=>void
+  onProgress: (msg: string) => void
 ): Promise<void> {
   const { Forma } = await import("forma-embedded-view-sdk/auto");
   onProgress("Building infrastructure overlay…");
 
-  const bbox = await Forma.terrain.getBbox();
-  const {min,max} = bbox;
-  const BUFFER_M = 30000;
-  const canvasMinX=min.x-BUFFER_M, canvasMinY=min.y-BUFFER_M;
-  const canvasW=(max.x-min.x)+BUFFER_M*2, canvasH=(max.y-min.y)+BUFFER_M*2;
-  const PPM=1/20;
-  const pxW=Math.ceil(canvasW*PPM), pxH=Math.ceil(canvasH*PPM);
+  // Place geometry 50m above terrain surface so it's always visible
+  let baseZ = 200;
+  try { const t = await getTerrainData(); baseZ = t.maxZ + 50; } catch { /* use default */ }
 
-  const canvas=document.createElement("canvas");
-  canvas.width=pxW; canvas.height=pxH;
-  const ctx=canvas.getContext("2d")!;
+  const LINE_W = 80;  // ribbon width in meters for transmission lines
+  const PT_SZ  = 300; // square side in meters for point markers
 
-  const toPixel=(lx:number,ly:number):[number,number]=>[
-    (lx-canvasMinX)*PPM,
-    pxH-(ly-canvasMinY)*PPM,
-  ];
+  const positions: number[] = [];
+  const colors:   number[] = [];
+
+  function vert(x: number, y: number, z: number, r: number, g: number, b: number, a: number) {
+    positions.push(x, y, z);
+    colors.push(r, g, b, a);
+  }
+
+  function addSegment(
+    x1: number, y1: number, x2: number, y2: number, z: number,
+    r: number, g: number, b: number, a: number
+  ) {
+    const dx = x2 - x1, dy = y2 - y1;
+    const len = Math.sqrt(dx*dx + dy*dy);
+    if (len < 0.1) return;
+    const nx = (-dy / len) * LINE_W / 2;
+    const ny = ( dx / len) * LINE_W / 2;
+    // quad corners: left-A, right-A, left-B, right-B
+    const lax = x1+nx, lay = y1+ny;
+    const rax = x1-nx, ray = y1-ny;
+    const lbx = x2+nx, lby = y2+ny;
+    const rbx = x2-nx, rby = y2-ny;
+    vert(lax,lay,z, r,g,b,a); vert(rax,ray,z, r,g,b,a); vert(lbx,lby,z, r,g,b,a);
+    vert(rax,ray,z, r,g,b,a); vert(rbx,rby,z, r,g,b,a); vert(lbx,lby,z, r,g,b,a);
+  }
+
+  function addBox(cx: number, cy: number, z: number, size: number, r: number, g: number, b: number, a: number) {
+    const h = size / 2;
+    vert(cx-h,cy-h,z, r,g,b,a); vert(cx+h,cy-h,z, r,g,b,a); vert(cx+h,cy+h,z, r,g,b,a);
+    vert(cx-h,cy-h,z, r,g,b,a); vert(cx+h,cy+h,z, r,g,b,a); vert(cx-h,cy+h,z, r,g,b,a);
+  }
 
   if (visibleTypes.has("line")) {
-    ctx.strokeStyle="#e74c3c"; ctx.lineWidth=2;
-    ctx.setLineDash([8,4]); ctx.globalAlpha=0.75;
-    for (const f of features.filter(f=>f.type==="line"&&f.coords)) {
-      const pts=f.coords!.map(([la,lo])=>{
-        const [lx,ly]=latLonToLocal(la,lo,refLat,refLon);
-        return toPixel(lx,ly);
-      });
-      if (pts.length<2) continue;
-      ctx.beginPath(); ctx.moveTo(pts[0][0],pts[0][1]);
-      for (let i=1;i<pts.length;i++) ctx.lineTo(pts[i][0],pts[i][1]);
-      ctx.stroke();
+    for (const f of features.filter(f => f.type === "line" && f.coords)) {
+      const pts = f.coords!.map(([la, lo]) => latLonToLocal(la, lo, refLat, refLon));
+      for (let i = 0; i < pts.length - 1; i++)
+        addSegment(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1], baseZ, 231, 76, 60, 200);
     }
-    ctx.setLineDash([]);
   }
 
   if (visibleTypes.has("plant")) {
-    for (const f of features.filter(f=>f.type==="plant")) {
-      const [lx,ly]=latLonToLocal(f.lat,f.lon,refLat,refLon);
-      const [px,py]=toPixel(lx,ly);
-      ctx.globalAlpha=0.9;
-      ctx.beginPath(); ctx.arc(px,py,14,0,Math.PI*2);
-      ctx.fillStyle="#e67e22"; ctx.fill();
-      ctx.strokeStyle="#fff"; ctx.lineWidth=2; ctx.stroke();
-      ctx.fillStyle="#fff"; ctx.font="bold 14px sans-serif";
-      ctx.textAlign="center"; ctx.textBaseline="middle";
-      ctx.fillText("⚡",px,py);
-      if (f.name) { ctx.globalAlpha=0.95; ctx.fillStyle="#000"; ctx.font="bold 11px Inter,sans-serif"; ctx.fillText(f.name.substring(0,24),px,py+20); }
+    for (const f of features.filter(f => f.type === "plant")) {
+      const [lx, ly] = latLonToLocal(f.lat, f.lon, refLat, refLon);
+      addBox(lx, ly, baseZ, PT_SZ, 230, 126, 34, 230);
     }
   }
 
   if (visibleTypes.has("substation")) {
-    for (const f of features.filter(f=>f.type==="substation")) {
-      const [lx,ly]=latLonToLocal(f.lat,f.lon,refLat,refLon);
-      const [px,py]=toPixel(lx,ly);
-      ctx.globalAlpha=0.92;
-      const size=14;
-      ctx.fillStyle="#0696d7"; ctx.fillRect(px-size/2,py-size/2,size,size);
-      ctx.strokeStyle="#fff"; ctx.lineWidth=2; ctx.strokeRect(px-size/2,py-size/2,size,size);
-      ctx.fillStyle="#fff"; ctx.font="bold 10px sans-serif"; ctx.textAlign="center"; ctx.textBaseline="middle";
-      ctx.fillText("S",px,py);
-      const label=f.name?f.name.substring(0,22):f.voltage?`${Number(f.voltage)>=1000?(Number(f.voltage)/1000).toFixed(0)+"kV":f.voltage+"V"} Sub`:"Substation";
-      ctx.globalAlpha=0.95; ctx.fillStyle="#000"; ctx.font="10px Inter,sans-serif"; ctx.fillText(label,px,py+18);
+    for (const f of features.filter(f => f.type === "substation")) {
+      const [lx, ly] = latLonToLocal(f.lat, f.lon, refLat, refLon);
+      addBox(lx, ly, baseZ, PT_SZ, 6, 150, 215, 230);
     }
   }
-  ctx.globalAlpha=1.0;
 
-  onProgress("Applying infrastructure overlay…");
-  const centerX=canvasMinX+canvasW/2, centerY=canvasMinY+canvasH/2;
-  try { await Forma.terrain.groundTexture.remove({name:"power-overlay"}); } catch {}
-  await Forma.terrain.groundTexture.add({
-    name:"power-overlay", canvas,
-    position:{x:centerX,y:centerY,z:3},
-    scale:{x:1/PPM,y:1/PPM},
-  });
+  if (positions.length === 0) { onProgress("done"); return; }
+
+  onProgress("Applying overlay…");
+  const geometryData = {
+    position: new Float32Array(positions),
+    color: new Uint8Array(colors),
+  };
+
+  if (powerMeshCache?.meshId) {
+    await Forma.render.updateMesh({ id: powerMeshCache.meshId, geometryData });
+  } else {
+    const { id } = await Forma.render.addMesh({ geometryData });
+    powerMeshCache = { meshId: id };
+  }
   onProgress("done");
 }
 
 export async function removePowerOverlay(): Promise<void> {
   const { Forma } = await import("forma-embedded-view-sdk/auto");
-  try { await Forma.terrain.groundTexture.remove({name:"power-overlay"}); } catch {}
+  if (powerMeshCache?.meshId) {
+    try { await Forma.render.remove({ id: powerMeshCache.meshId }); } catch {}
+    powerMeshCache = null;
+  }
+  // Clean up any legacy groundTexture from before this fix
+  try { await Forma.terrain.groundTexture.remove({ name: "power-overlay" }); } catch {}
 }

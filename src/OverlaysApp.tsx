@@ -1,4 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+
+declare const __APP_VERSION__: string;
 import {
   SLOPE_BANDS,
   renderSlopeOverlay, removeSlopeOverlay, updateSlopeOpacity,
@@ -145,7 +147,7 @@ export default function OverlaysApp() {
       <div style={{padding:"10px 14px",display:"flex",flexDirection:"column",gap:10}}>
 
         {/* ── Slope ──────────────────────────────────────────────────────── */}
-        <OverlayCard title="Slope analysis" iconChar="S" iconBg="#e8f5e9" iconColor="#2ecc71"
+        <OverlayCard title="Slope analysis" iconColor="#2ecc71"
           state={slopeState} msg={slopeMsg} onToggle={toggleSlope} activeColor="#2ecc71"
           description="Per-triangle slope computed from terrain mesh face normals.">
           <>
@@ -165,7 +167,7 @@ export default function OverlaysApp() {
         </OverlayCard>
 
         {/* ── Power ──────────────────────────────────────────────────────── */}
-        <OverlayCard title="Power infrastructure" iconChar="P" iconBg={T.blueLt} iconColor={T.blue}
+        <OverlayCard title="Power infrastructure" iconColor={T.blue}
           state={powerState} msg={powerMsg} onToggle={togglePower} activeColor={T.blue}
           description="HV substations, power plants, and transmission lines from OpenStreetMap.">
           <div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${T.border}`}}>
@@ -215,9 +217,14 @@ export default function OverlaysApp() {
         </OverlayCard>
 
         {/* Attribution */}
-        <div style={{fontSize:10,color:T.tx3,lineHeight:1.5,paddingBottom:12}}>
+        <div style={{fontSize:10,color:T.tx3,lineHeight:1.5,paddingBottom:4}}>
           Infrastructure © OpenStreetMap contributors (ODbL).
           Slope from Forma terrain mesh.
+        </div>
+
+        {/* Version */}
+        <div style={{fontSize:10,color:T.tx3,paddingBottom:12,textAlign:"right"}}>
+          Site Overlays v{__APP_VERSION__}
         </div>
       </div>
     </div>
@@ -247,8 +254,8 @@ function OpacitySlider({label,value,onChange,color}:{label:string;value:number;o
 
 // ─── OverlayCard ─────────────────────────────────────────────────────────────
 
-function OverlayCard({title,iconChar,iconBg,iconColor,state,msg,onToggle,activeColor,description,children}:{
-  title:string;iconChar:string;iconBg:string;iconColor:string;
+function OverlayCard({title,iconColor,state,msg,onToggle,activeColor,description,children}:{
+  title:string;iconColor:string;
   state:OverlayState;msg:string;onToggle:()=>void;
   activeColor:string;description:string;children?:React.ReactNode;
 }) {
@@ -258,11 +265,8 @@ function OverlayCard({title,iconChar,iconBg,iconColor,state,msg,onToggle,activeC
       borderRadius:8,background:"#fff",overflow:"hidden",
       boxShadow:isOn?`0 0 0 2px ${activeColor}18`:"none",transition:"all .2s"}}>
       <div style={{padding:"10px 12px",background:isOn?`${activeColor}09`:"#fff"}}>
-        <div style={{display:"flex",alignItems:"center",gap:9,marginBottom:4}}>
-          <div style={{width:28,height:28,borderRadius:5,background:iconBg,flexShrink:0,
-            display:"flex",alignItems:"center",justifyContent:"center"}}>
-            <span style={{fontSize:12,fontWeight:700,color:iconColor}}>{iconChar}</span>
-          </div>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+          <div style={{width:8,height:8,borderRadius:"50%",background:iconColor,flexShrink:0}}/>
           <span style={{flex:1,fontSize:13,fontWeight:500,color:isOn?activeColor:"#1a1a1a"}}>{title}</span>
           <div onClick={isLoading?undefined:onToggle}
             style={{width:42,height:23,borderRadius:12,background:isOn?activeColor:"#ccc",
@@ -277,7 +281,7 @@ function OverlayCard({title,iconChar,iconBg,iconColor,state,msg,onToggle,activeC
                   boxShadow:"0 1px 3px rgba(0,0,0,.2)"}}/>}
           </div>
         </div>
-        <div style={{fontSize:11,color:"#777",lineHeight:1.3,paddingLeft:37}}>{description}</div>
+        <div style={{fontSize:11,color:"#777",lineHeight:1.3}}>{description}</div>
         {isLoading&&msg&&(
           <div style={{display:"flex",alignItems:"center",gap:6,marginTop:5,paddingLeft:37}}>
             <div style={{width:9,height:9,borderRadius:5,flexShrink:0,border:`2px solid ${activeColor}`,
