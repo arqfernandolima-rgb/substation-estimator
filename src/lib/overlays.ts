@@ -468,11 +468,14 @@ const OVERPASS_ENDPOINTS = [
   "https://overpass.kumi.systems/api/interpreter",
 ];
 
-async function overpassFetch(query: string): Promise<any> {
+// preferSecondary=true tries kumi.systems first — used to split two parallel
+// OSM fetches across different servers so neither gets rate-limited.
+async function overpassFetch(query: string, preferSecondary = false): Promise<any> {
   const body = `data=${encodeURIComponent(query)}`;
   const headers = { "Content-Type": "application/x-www-form-urlencoded" };
+  const endpoints = preferSecondary ? [...OVERPASS_ENDPOINTS].reverse() : OVERPASS_ENDPOINTS;
   let lastErr: unknown;
-  for (const endpoint of OVERPASS_ENDPOINTS) {
+  for (const endpoint of endpoints) {
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 25000);
@@ -485,21 +488,31 @@ async function overpassFetch(query: string): Promise<any> {
   throw lastErr;
 }
 
-// Substations + plants — lightweight query, center point only (no geometry needed)
+// bbox string for Overpass — square approximation of the radius circle.
+// Bbox uses the spatial index directly; around: requires per-element distance
+// computation and is 3–5× slower.
+function osmBbox(lat: number, lon: number, radiusM: number): string {
+  const latD = radiusM / 111_320;
+  const lonD = radiusM / (111_320 * Math.cos(lat * Math.PI / 180));
+  return `${lat-latD},${lon-lonD},${lat+latD},${lon+lonD}`;
+}
+
+// Runs on primary endpoint (overpass-api.de first)
 async function fetchOSMSubstationsPlants(
   lat: number, lon: number, radiusM: number,
 ): Promise<InfraFeature[]> {
+  const bb = osmBbox(lat, lon, radiusM);
   const query = `
     [out:json][timeout:20];
     (
-      node["power"="substation"]["voltage"~"^[1-9]"](around:${radiusM},${lat},${lon});
-      way["power"="substation"]["voltage"~"^[1-9]"](around:${radiusM},${lat},${lon});
-      node["power"="plant"](around:${radiusM},${lat},${lon});
-      way["power"="plant"](around:${radiusM},${lat},${lon});
+      node["power"="substation"]["voltage"~"^[1-9]"](${bb});
+      way["power"="substation"]["voltage"~"^[1-9]"](${bb});
+      node["power"="plant"](${bb});
+      way["power"="plant"](${bb});
     );
     out center;
   `;
-  const data = await overpassFetch(query);
+  const data = await overpassFetch(query, false);
   const features: InfraFeature[] = [];
   for (const el of data.elements ?? []) {
     const clat = el.lat ?? el.center?.lat;
@@ -517,56 +530,45 @@ async function fetchOSMSubstationsPlants(
   return features;
 }
 
-// Pipelines — uses endpoints in reverse order from subs/plants to avoid hitting
-// the same Overpass server twice in quick succession (rate-limit avoidance).
+// Runs on secondary endpoint (kumi.systems first) so it doesn't compete with
+// fetchOSMSubstationsPlants when both run in parallel.
 async function fetchOSMPipelines(
   lat: number, lon: number, radiusM: number,
 ): Promise<InfraFeature[]> {
+  const bb = osmBbox(lat, lon, radiusM);
   const query = `
     [out:json][timeout:25];
-    way["man_made"="pipeline"](around:${radiusM},${lat},${lon});
+    way["man_made"="pipeline"](${bb});
     out geom;
   `;
-  const body = `data=${encodeURIComponent(query)}`;
-  const headers = { "Content-Type": "application/x-www-form-urlencoded" };
-  let lastErr: unknown;
-  for (const endpoint of [...OVERPASS_ENDPOINTS].reverse()) {
-    try {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 25000);
-      const resp = await fetch(endpoint, { method: "POST", headers, body, signal: ctrl.signal });
-      clearTimeout(timer);
-      if (!resp.ok) throw new Error(`HTTP ${resp.status} from ${endpoint}`);
-      const data = await resp.json();
-      const features: InfraFeature[] = [];
-      for (const el of data.elements ?? []) {
-        if (!el.geometry || el.geometry.length < 2) continue;
-        const tags = el.tags ?? {};
-        const substance = tags.substance || "";
-        const name = tags.name || (substance ? `${substance} pipeline` : "Pipeline");
-        const midIdx = Math.floor(el.geometry.length / 2);
-        const mid = el.geometry[midIdx];
-        const coords: [number,number][] = el.geometry.map((n:{lat:number;lon:number}) => [n.lat, n.lon] as [number,number]);
-        features.push({ type:"pipeline", name, lat:mid.lat, lon:mid.lon, coords });
-      }
-      return features;
-    } catch(e) { lastErr = e; }
+  const data = await overpassFetch(query, true);
+  const features: InfraFeature[] = [];
+  for (const el of data.elements ?? []) {
+    if (!el.geometry || el.geometry.length < 2) continue;
+    const tags = el.tags ?? {};
+    const substance = tags.substance || "";
+    const name = tags.name || (substance ? `${substance} pipeline` : "Pipeline");
+    const midIdx = Math.floor(el.geometry.length / 2);
+    const mid = el.geometry[midIdx];
+    const coords: [number,number][] = el.geometry.map((n:{lat:number;lon:number}) => [n.lat, n.lon] as [number,number]);
+    features.push({ type:"pipeline", name, lat:mid.lat, lon:mid.lon, coords });
   }
-  throw lastErr;
+  return features;
 }
 
 // Full OSM fallback (lines + subs + plants) used only when both primary sources fail
 async function fetchOSMAll(
   lat: number, lon: number, radiusM: number,
 ): Promise<InfraFeature[]> {
+  const bb = osmBbox(lat, lon, radiusM);
   const query = `
     [out:json][timeout:25];
     (
-      node["power"="substation"]["voltage"~"^[1-9]"](around:${radiusM},${lat},${lon});
-      way["power"="substation"]["voltage"~"^[1-9]"](around:${radiusM},${lat},${lon});
-      node["power"="plant"](around:${radiusM},${lat},${lon});
-      way["power"="plant"](around:${radiusM},${lat},${lon});
-      way["power"="line"]["voltage"~"^[1-9][0-9]{4,}"](around:${radiusM},${lat},${lon});
+      node["power"="substation"]["voltage"~"^[1-9]"](${bb});
+      way["power"="substation"]["voltage"~"^[1-9]"](${bb});
+      node["power"="plant"](${bb});
+      way["power"="plant"](${bb});
+      way["power"="line"]["voltage"~"^[1-9][0-9]{4,}"](${bb});
     );
     out center geom;
   `;
@@ -598,36 +600,25 @@ export async function fetchPowerInfrastructure(
 ): Promise<InfraFeature[]> {
   onProgress?.("Querying power infrastructure…");
 
-  // Step 1: HIFLD (lines) + OSM subs/plants in parallel — different APIs, no conflict
-  const [linesResult, osmResult] = await Promise.allSettled([
+  // All three run in parallel: HIFLD on its own server, OSM subs/plants on
+  // overpass-api.de, pipelines on overpass.kumi.systems — no server sees two
+  // simultaneous requests, no rate-limiting.
+  const [linesResult, osmResult, pipeResult] = await Promise.allSettled([
     fetchHIFLDLines(lat, lon, radiusM),
     fetchOSMSubstationsPlants(lat, lon, radiusM),
+    includePipelines ? fetchOSMPipelines(lat, lon, radiusM) : Promise.resolve([] as InfraFeature[]),
   ]);
 
   const features: InfraFeature[] = [];
   if (linesResult.status === "fulfilled") features.push(...linesResult.value);
   if (osmResult.status   === "fulfilled") features.push(...osmResult.value);
+  if (pipeResult.status  === "fulfilled") features.push(...pipeResult.value);
 
   // If we got no power features at all, fall back to full OSM query
-  if (features.length === 0) {
+  if (features.filter(f => f.type !== "pipeline").length === 0) {
     onProgress?.("Primary sources unavailable, trying OSM fallback…");
     const fallback = await fetchOSMAll(lat, lon, radiusM);
     features.push(...fallback);
-  }
-
-  // Step 2: pipelines — brief pause lets the Overpass rate-limit window reset,
-  // then try the alternate endpoint (reversed order vs subs/plants fetch).
-  if (includePipelines) {
-    await new Promise(r => setTimeout(r, 1500));
-    onProgress?.("Querying pipeline data…");
-    try {
-      const pipes = await fetchOSMPipelines(lat, lon, radiusM);
-      features.push(...pipes);
-    } catch (e) {
-      // Surface the real error so it shows in the status message
-      onProgress?.(`Pipeline fetch failed: ${String(e).substring(0, 100)}`);
-      await new Promise(r => setTimeout(r, 3000));
-    }
   }
 
   const subs      = features.filter(f=>f.type==="substation").length;
