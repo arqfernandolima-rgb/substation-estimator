@@ -19,7 +19,7 @@ const T = {
 
 const IS_IN_FORMA = window.location.search.includes("origin=");
 type OverlayState = "off" | "loading" | "on" | "error";
-type InfraLayer = { substations:boolean; plants:boolean; lines:boolean };
+type InfraLayer = { substations:boolean; plants:boolean; lines:boolean; pipelines:boolean };
 
 
 export default function OverlaysApp() {
@@ -28,9 +28,9 @@ export default function OverlaysApp() {
   const [slopeOpacity, setSlopeOpacity] = useState(0.80);
   const [powerState,   setPowerState]   = useState<OverlayState>("off");
   const [powerMsg,     setPowerMsg]     = useState("");
-  const [infraLayers,  setInfraLayers]  = useState<InfraLayer>({substations:true,plants:true,lines:true});
+  const [infraLayers,  setInfraLayers]  = useState<InfraLayer>({substations:true,plants:true,lines:true,pipelines:false});
   const [infraCache,   setInfraCache]   = useState<InfraFeature[]|null>(null);
-  const [infraStats,   setInfraStats]   = useState<{subs:number;plants:number;lines:number}|null>(null);
+  const [infraStats,   setInfraStats]   = useState<{subs:number;plants:number;lines:number;pipelines:number}|null>(null);
   const [refLatLon,    setRefLatLon]    = useState<[number,number]|null>(null);
   const [radiusMi,     setRadiusMi]     = useState(25);
 
@@ -93,7 +93,7 @@ export default function OverlaysApp() {
               coords:[[35.800,-78.900],[35.750,-78.830],[35.690,-78.770]]},
           ];
         } else {
-          features = await fetchPowerInfrastructure(latLon[0],latLon[1],radiusMi*1609.34,msg=>setPowerMsg(msg));
+          features = await fetchPowerInfrastructure(latLon[0],latLon[1],radiusMi*1609.34,msg=>setPowerMsg(msg),layers.pipelines);
         }
         setInfraCache(features);
       }
@@ -101,11 +101,13 @@ export default function OverlaysApp() {
         subs:features.filter(f=>f.type==="substation").length,
         plants:features.filter(f=>f.type==="plant").length,
         lines:features.filter(f=>f.type==="line").length,
+        pipelines:features.filter(f=>f.type==="pipeline").length,
       });
-      const visible=new Set<"substation"|"plant"|"line">();
+      const visible=new Set<"substation"|"plant"|"line"|"pipeline">();
       if (layers.substations) visible.add("substation");
       if (layers.plants)      visible.add("plant");
       if (layers.lines)       visible.add("line");
+      if (layers.pipelines)   visible.add("pipeline");
       if (!IS_IN_FORMA){await new Promise(r=>setTimeout(r,500));setPowerState("on");setPowerMsg("");return;}
       await renderPowerOverlay(features,latLon[0],latLon[1],visible,msg=>{
         if(msg==="done"){setPowerState("on");setPowerMsg("");}else setPowerMsg(msg);
@@ -122,12 +124,17 @@ export default function OverlaysApp() {
   const prevLayersRef = useRef(infraLayers);
   useEffect(()=>{
     const prev=prevLayersRef.current;
-    if (powerState==="on"&&(prev.substations!==infraLayers.substations||prev.plants!==infraLayers.plants||prev.lines!==infraLayers.lines))
+    if (powerState==="on"&&(prev.substations!==infraLayers.substations||prev.plants!==infraLayers.plants||prev.lines!==infraLayers.lines||prev.pipelines!==infraLayers.pipelines))
       applyPowerOverlay(infraCache,infraLayers,refLatLon);
     prevLayersRef.current=infraLayers;
   },[infraLayers,powerState,infraCache,refLatLon,applyPowerOverlay]);
 
-  const toggleLayer=(k:keyof InfraLayer)=>setInfraLayers(p=>({...p,[k]:!p[k]}));
+  const toggleLayer=(k:keyof InfraLayer)=>{
+    if(k==="pipelines"&&!infraLayers.pipelines&&!infraCache?.some(f=>f.type==="pipeline")){
+      setInfraCache(null);setInfraStats(null);
+    }
+    setInfraLayers(p=>({...p,[k]:!p[k]}));
+  };
   const clearCache=()=>{
     setInfraCache(null);setInfraStats(null);
     clearTerrainCache();
@@ -183,9 +190,10 @@ export default function OverlaysApp() {
             </div>
             <div style={{fontSize:10,fontWeight:600,color:T.tx3,textTransform:"uppercase",letterSpacing:.5,marginBottom:5}}>Layers</div>
             {([
-              {key:"substations" as keyof InfraLayer,label:"HV Substations",color:T.blue,sym:"■"},
-              {key:"plants"      as keyof InfraLayer,label:"Power plants",   color:"#e67e22",sym:"●"},
-              {key:"lines"       as keyof InfraLayer,label:"Trans. lines",   color:"#e74c3c",sym:"—"},
+              {key:"substations" as keyof InfraLayer,label:"HV Substations",color:T.blue,    sym:"■"},
+              {key:"plants"      as keyof InfraLayer,label:"Power plants",   color:"#e67e22", sym:"●"},
+              {key:"lines"       as keyof InfraLayer,label:"Trans. lines",   color:"#e74c3c", sym:"—"},
+              {key:"pipelines"   as keyof InfraLayer,label:"Pipelines",      color:"#27ae60", sym:"~"},
             ] as const).map(({key,label,color,sym})=>(
               <div key={key} onClick={()=>toggleLayer(key)}
                 style={{display:"flex",alignItems:"center",gap:7,padding:"5px 7px",marginBottom:3,
@@ -194,7 +202,7 @@ export default function OverlaysApp() {
                   background:infraLayers[key]?`${color}0d`:"#fafafa",transition:"all .1s"}}>
                 <span style={{fontSize:13,color,fontWeight:"bold",width:14,textAlign:"center"}}>{sym}</span>
                 <span style={{flex:1,fontSize:11,color:infraLayers[key]?T.tx1:T.tx3,fontWeight:infraLayers[key]?500:400}}>{label}</span>
-                {infraStats&&<span style={{fontSize:10,color:T.tx3}}>{key==="substations"?infraStats.subs:key==="plants"?infraStats.plants:infraStats.lines}</span>}
+                {infraStats&&<span style={{fontSize:10,color:T.tx3}}>{key==="substations"?infraStats.subs:key==="plants"?infraStats.plants:key==="lines"?infraStats.lines:infraStats.pipelines}</span>}
                 <div style={{width:15,height:15,borderRadius:3,border:`1.5px solid ${infraLayers[key]?color:"#ccc"}`,
                   background:infraLayers[key]?color:"#fff",display:"flex",alignItems:"center",justifyContent:"center"}}>
                   {infraLayers[key]&&<span style={{color:"#fff",fontSize:9,fontWeight:"bold"}}>✓</span>}
@@ -206,7 +214,11 @@ export default function OverlaysApp() {
                 border:`1px solid ${T.blueMid}`,fontSize:11,color:T.tx2}}>
                 <span style={{color:T.blue,fontWeight:500}}>✓ Active</span>
                 {" · "}{infraStats.subs} sub · {infraStats.plants} plant · {infraStats.lines} lines
-                <br/><span style={{fontSize:10,color:T.tx3}}>OpenStreetMap · {radiusMi} mi</span>
+                {infraStats.pipelines>0&&` · ${infraStats.pipelines} pipelines`}
+                <br/><span style={{fontSize:10,color:T.tx3}}>
+                  OpenStreetMap · {radiusMi} mi
+                  {refLatLon&&` · ref ${refLatLon[0].toFixed(4)}, ${refLatLon[1].toFixed(4)}`}
+                </span>
               </div>
             )}
             {infraCache&&<button onClick={clearCache}

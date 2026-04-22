@@ -407,7 +407,7 @@ export async function removeTopoOverlay(): Promise<void> {
 let powerMeshCache: { meshId: string | null } | null = null;
 
 export type InfraFeature = {
-  type:    "substation" | "plant" | "line";
+  type:    "substation" | "plant" | "line" | "pipeline";
   name:    string;
   lat:     number;
   lon:     number;
@@ -517,6 +517,28 @@ async function fetchOSMSubstationsPlants(
   return features;
 }
 
+async function fetchOSMPipelines(
+  lat: number, lon: number, radiusM: number,
+): Promise<InfraFeature[]> {
+  const query = `
+    [out:json][timeout:20];
+    way["man_made"="pipeline"](around:${radiusM},${lat},${lon});
+    out geom;
+  `;
+  const data = await overpassFetch(query);
+  const features: InfraFeature[] = [];
+  for (const el of data.elements ?? []) {
+    if (!el.geometry || el.geometry.length < 2) continue;
+    const tags = el.tags ?? {};
+    const name = tags.name || tags.substance || "Pipeline";
+    const midIdx = Math.floor(el.geometry.length / 2);
+    const mid = el.geometry[midIdx];
+    const coords: [number,number][] = el.geometry.map((n:{lat:number;lon:number}) => [n.lat, n.lon] as [number,number]);
+    features.push({ type:"pipeline", name, lat:mid.lat, lon:mid.lon, coords });
+  }
+  return features;
+}
+
 // Full OSM fallback (lines + subs + plants) used only when both primary sources fail
 async function fetchOSMAll(
   lat: number, lon: number, radiusM: number,
@@ -555,31 +577,35 @@ async function fetchOSMAll(
 
 export async function fetchPowerInfrastructure(
   lat: number, lon: number, radiusM = 40000,
-  onProgress?: (msg: string) => void
+  onProgress?: (msg: string) => void,
+  includePipelines = false,
 ): Promise<InfraFeature[]> {
   onProgress?.("Querying power infrastructure…");
 
-  // HIFLD lines + OSM subs/plants run in parallel — each can fail independently
-  const [linesResult, osmResult] = await Promise.allSettled([
+  const [linesResult, osmResult, pipelineResult] = await Promise.allSettled([
     fetchHIFLDLines(lat, lon, radiusM),
     fetchOSMSubstationsPlants(lat, lon, radiusM),
+    includePipelines ? fetchOSMPipelines(lat, lon, radiusM) : Promise.resolve([] as InfraFeature[]),
   ]);
 
   const features: InfraFeature[] = [];
-  if (linesResult.status === "fulfilled") features.push(...linesResult.value);
-  if (osmResult.status   === "fulfilled") features.push(...osmResult.value);
+  if (linesResult.status   === "fulfilled") features.push(...linesResult.value);
+  if (osmResult.status     === "fulfilled") features.push(...osmResult.value);
+  if (pipelineResult.status === "fulfilled") features.push(...pipelineResult.value);
 
-  // If we got nothing at all, fall back to full OSM query
-  if (features.length === 0) {
+  // If we got no power features at all, fall back to full OSM query
+  if (features.filter(f => f.type !== "pipeline").length === 0) {
     onProgress?.("Primary sources unavailable, trying OSM fallback…");
     const fallback = await fetchOSMAll(lat, lon, radiusM);
     features.push(...fallback);
   }
 
-  const subs   = features.filter(f=>f.type==="substation").length;
-  const plants = features.filter(f=>f.type==="plant").length;
-  const lines  = features.filter(f=>f.type==="line").length;
-  onProgress?.(`Found ${subs} substations, ${plants} plants, ${lines} lines`);
+  const subs      = features.filter(f=>f.type==="substation").length;
+  const plants    = features.filter(f=>f.type==="plant").length;
+  const lines     = features.filter(f=>f.type==="line").length;
+  const pipelines = features.filter(f=>f.type==="pipeline").length;
+  const pipeStr   = includePipelines ? `, ${pipelines} pipelines` : "";
+  onProgress?.(`Found ${subs} substations, ${plants} plants, ${lines} lines${pipeStr}`);
   return features;
 }
 
@@ -592,7 +618,7 @@ function latLonToLocal(lat:number,lon:number,refLat:number,refLon:number):[numbe
 
 export async function renderPowerOverlay(
   features: InfraFeature[], refLat: number, refLon: number,
-  visibleTypes: Set<"substation"|"plant"|"line">,
+  visibleTypes: Set<"substation"|"plant"|"line"|"pipeline">,
   onProgress: (msg: string) => void
 ): Promise<void> {
   const { Forma } = await import("forma-embedded-view-sdk/auto");
@@ -602,8 +628,8 @@ export async function renderPowerOverlay(
   let baseZ = 200;
   try { const t = await getTerrainData(); baseZ = t.maxZ + 50; } catch { /* use default */ }
 
-  const LINE_W = 80;  // ribbon width in meters for transmission lines
-  const PT_SZ  = 300; // square side in meters for point markers
+  const LINE_W = 6;   // ribbon width in meters for transmission lines
+  const PT_SZ  = 60;  // square side in meters for point markers
 
   const positions: number[] = [];
   const colors:   number[] = [];
@@ -635,6 +661,14 @@ export async function renderPowerOverlay(
     const h = size / 2;
     vert(cx-h,cy-h,z, r,g,b,a); vert(cx+h,cy-h,z, r,g,b,a); vert(cx+h,cy+h,z, r,g,b,a);
     vert(cx-h,cy-h,z, r,g,b,a); vert(cx+h,cy+h,z, r,g,b,a); vert(cx-h,cy+h,z, r,g,b,a);
+  }
+
+  if (visibleTypes.has("pipeline")) {
+    for (const f of features.filter(f => f.type === "pipeline" && f.coords)) {
+      const pts = f.coords!.map(([la, lo]) => latLonToLocal(la, lo, refLat, refLon));
+      for (let i = 0; i < pts.length - 1; i++)
+        addSegment(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1], baseZ, 39, 174, 96, 200); // green
+    }
   }
 
   if (visibleTypes.has("line")) {
