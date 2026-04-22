@@ -517,8 +517,8 @@ async function fetchOSMSubstationsPlants(
   return features;
 }
 
-// Pipelines — separate query so it doesn't run in parallel with subs/plants
-// (simultaneous Overpass requests trigger rate-limiting)
+// Pipelines — uses endpoints in reverse order from subs/plants to avoid hitting
+// the same Overpass server twice in quick succession (rate-limit avoidance).
 async function fetchOSMPipelines(
   lat: number, lon: number, radiusM: number,
 ): Promise<InfraFeature[]> {
@@ -527,19 +527,32 @@ async function fetchOSMPipelines(
     way["man_made"="pipeline"](around:${radiusM},${lat},${lon});
     out geom;
   `;
-  const data = await overpassFetch(query);
-  const features: InfraFeature[] = [];
-  for (const el of data.elements ?? []) {
-    if (!el.geometry || el.geometry.length < 2) continue;
-    const tags = el.tags ?? {};
-    const substance = tags.substance || "";
-    const name = tags.name || (substance ? `${substance} pipeline` : "Pipeline");
-    const midIdx = Math.floor(el.geometry.length / 2);
-    const mid = el.geometry[midIdx];
-    const coords: [number,number][] = el.geometry.map((n:{lat:number;lon:number}) => [n.lat, n.lon] as [number,number]);
-    features.push({ type:"pipeline", name, lat:mid.lat, lon:mid.lon, coords });
+  const body = `data=${encodeURIComponent(query)}`;
+  const headers = { "Content-Type": "application/x-www-form-urlencoded" };
+  let lastErr: unknown;
+  for (const endpoint of [...OVERPASS_ENDPOINTS].reverse()) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 25000);
+      const resp = await fetch(endpoint, { method: "POST", headers, body, signal: ctrl.signal });
+      clearTimeout(timer);
+      if (!resp.ok) throw new Error(`HTTP ${resp.status} from ${endpoint}`);
+      const data = await resp.json();
+      const features: InfraFeature[] = [];
+      for (const el of data.elements ?? []) {
+        if (!el.geometry || el.geometry.length < 2) continue;
+        const tags = el.tags ?? {};
+        const substance = tags.substance || "";
+        const name = tags.name || (substance ? `${substance} pipeline` : "Pipeline");
+        const midIdx = Math.floor(el.geometry.length / 2);
+        const mid = el.geometry[midIdx];
+        const coords: [number,number][] = el.geometry.map((n:{lat:number;lon:number}) => [n.lat, n.lon] as [number,number]);
+        features.push({ type:"pipeline", name, lat:mid.lat, lon:mid.lon, coords });
+      }
+      return features;
+    } catch(e) { lastErr = e; }
   }
-  return features;
+  throw lastErr;
 }
 
 // Full OSM fallback (lines + subs + plants) used only when both primary sources fail
@@ -602,11 +615,19 @@ export async function fetchPowerInfrastructure(
     features.push(...fallback);
   }
 
-  // Step 2: pipelines run AFTER subs/plants — sequential avoids Overpass rate-limiting
+  // Step 2: pipelines — brief pause lets the Overpass rate-limit window reset,
+  // then try the alternate endpoint (reversed order vs subs/plants fetch).
   if (includePipelines) {
+    await new Promise(r => setTimeout(r, 1500));
     onProgress?.("Querying pipeline data…");
-    const pipes = await fetchOSMPipelines(lat, lon, radiusM).catch(() => [] as InfraFeature[]);
-    features.push(...pipes);
+    try {
+      const pipes = await fetchOSMPipelines(lat, lon, radiusM);
+      features.push(...pipes);
+    } catch (e) {
+      // Surface the real error so it shows in the status message
+      onProgress?.(`Pipeline fetch failed: ${String(e).substring(0, 100)}`);
+      await new Promise(r => setTimeout(r, 3000));
+    }
   }
 
   const subs      = features.filter(f=>f.type==="substation").length;
