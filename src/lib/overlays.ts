@@ -485,19 +485,24 @@ async function overpassFetch(query: string): Promise<any> {
   throw lastErr;
 }
 
-// Substations + plants only — no lines (HIFLD handles those), keeps query fast
-async function fetchOSMSubstationsPlants(
-  lat: number, lon: number, radiusM: number,
+// Single combined OSM query: substations + plants + optional pipelines.
+// Keeping it one request avoids Overpass rate-limiting two simultaneous fetches.
+async function fetchOSMData(
+  lat: number, lon: number, radiusM: number, includePipelines: boolean,
 ): Promise<InfraFeature[]> {
+  const pipeClause = includePipelines
+    ? `way["man_made"="pipeline"](around:${radiusM},${lat},${lon});`
+    : "";
   const query = `
-    [out:json][timeout:20];
+    [out:json][timeout:25];
     (
       node["power"="substation"]["voltage"~"^[1-9]"](around:${radiusM},${lat},${lon});
       way["power"="substation"]["voltage"~"^[1-9]"](around:${radiusM},${lat},${lon});
       node["power"="plant"](around:${radiusM},${lat},${lon});
       way["power"="plant"](around:${radiusM},${lat},${lon});
+      ${pipeClause}
     );
-    out center;
+    out center geom;
   `;
   const data = await overpassFetch(query);
   const features: InfraFeature[] = [];
@@ -505,46 +510,21 @@ async function fetchOSMSubstationsPlants(
     const clat = el.lat ?? el.center?.lat;
     const clon = el.lon ?? el.center?.lon;
     if (!clat || !clon) continue;
-    const tags  = el.tags ?? {};
-    const name  = tags.name || tags["name:en"] || "";
+    const tags = el.tags ?? {};
+    const name = tags.name || tags["name:en"] || "";
     const voltage = tags.voltage ?? "";
     if (tags.power === "substation") {
       features.push({ type:"substation", name: name || `Substation (${voltage||"HV"})`, lat:clat, lon:clon, voltage });
     } else if (tags.power === "plant") {
       features.push({ type:"plant", name: name || "Power plant", lat:clat, lon:clon, fuel: tags["plant:source"] ?? tags.generator ?? "" });
+    } else if (tags.man_made === "pipeline" && el.geometry?.length >= 2) {
+      const substance = tags.substance || tags.pipeline || "";
+      const pname = tags.name || (substance ? `${substance} pipeline` : "Pipeline");
+      const midIdx = Math.floor(el.geometry.length / 2);
+      const mid = el.geometry[midIdx];
+      const coords: [number,number][] = el.geometry.map((n:{lat:number;lon:number}) => [n.lat, n.lon] as [number,number]);
+      features.push({ type:"pipeline", name:pname, lat:mid.lat ?? clat, lon:mid.lon ?? clon, coords });
     }
-  }
-  return features;
-}
-
-async function fetchOSMPipelines(
-  lat: number, lon: number, radiusM: number,
-): Promise<InfraFeature[]> {
-  // Broad query: man_made=pipeline covers most tagged pipelines; adding ways with
-  // any pipeline=* tag catches oil/gas lines tagged by substance rather than man_made.
-  const query = `
-    [out:json][timeout:25];
-    (
-      way["man_made"="pipeline"](around:${radiusM},${lat},${lon});
-      way["pipeline"~"."](around:${radiusM},${lat},${lon});
-    );
-    out geom;
-  `;
-  const data = await overpassFetch(query);
-  const seen = new Set<string>();
-  const features: InfraFeature[] = [];
-  for (const el of data.elements ?? []) {
-    if (!el.geometry || el.geometry.length < 2) continue;
-    const id = String(el.id);
-    if (seen.has(id)) continue;
-    seen.add(id);
-    const tags = el.tags ?? {};
-    const substance = tags.substance || tags.pipeline || "";
-    const name = tags.name || (substance ? `${substance} pipeline` : "Pipeline");
-    const midIdx = Math.floor(el.geometry.length / 2);
-    const mid = el.geometry[midIdx];
-    const coords: [number,number][] = el.geometry.map((n:{lat:number;lon:number}) => [n.lat, n.lon] as [number,number]);
-    features.push({ type:"pipeline", name, lat:mid.lat, lon:mid.lon, coords });
   }
   return features;
 }
@@ -592,16 +572,16 @@ export async function fetchPowerInfrastructure(
 ): Promise<InfraFeature[]> {
   onProgress?.("Querying power infrastructure…");
 
-  const [linesResult, osmResult, pipelineResult] = await Promise.allSettled([
+  // Two parallel fetches: HIFLD (lines) + combined OSM (subs/plants/pipelines).
+  // Previously three fetches — simultaneous OSM requests triggered Overpass rate-limiting.
+  const [linesResult, osmResult] = await Promise.allSettled([
     fetchHIFLDLines(lat, lon, radiusM),
-    fetchOSMSubstationsPlants(lat, lon, radiusM),
-    includePipelines ? fetchOSMPipelines(lat, lon, radiusM) : Promise.resolve([] as InfraFeature[]),
+    fetchOSMData(lat, lon, radiusM, includePipelines),
   ]);
 
   const features: InfraFeature[] = [];
-  if (linesResult.status   === "fulfilled") features.push(...linesResult.value);
-  if (osmResult.status     === "fulfilled") features.push(...osmResult.value);
-  if (pipelineResult.status === "fulfilled") features.push(...pipelineResult.value);
+  if (linesResult.status === "fulfilled") features.push(...linesResult.value);
+  if (osmResult.status   === "fulfilled") features.push(...osmResult.value);
 
   // If we got no power features at all, fall back to full OSM query
   if (features.filter(f => f.type !== "pipeline").length === 0) {
@@ -730,13 +710,13 @@ export async function renderPowerOverlay(
         addSegment(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1], baseZ, LINE_W, 231, 76, 60, 200);
     }
     // Voltage labels at each line's midpoint — rendered above lines (baseZ+1)
-    const CHAR_H = 80;
+    const CHAR_H = 36;
     for (const f of features.filter(f => f.type === "line")) {
       const v = parseInt(f.voltage ?? "0");
       if (!v) continue;
       const kv = Math.round(v / 1000);
       const [lx, ly] = latLonToLocal(f.lat, f.lon, refLat, refLon);
-      addGlyphLabel(lx, ly + CHAR_H * 0.9, baseZ + 1, `${kv}kV`, CHAR_H, 255, 255, 255, 230);
+      addGlyphLabel(lx, ly + CHAR_H * 0.9, baseZ + 1, `${kv}kV`, CHAR_H, 150, 150, 150, 230);
     }
   }
 
