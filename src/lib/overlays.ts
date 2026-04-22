@@ -520,17 +520,27 @@ async function fetchOSMSubstationsPlants(
 async function fetchOSMPipelines(
   lat: number, lon: number, radiusM: number,
 ): Promise<InfraFeature[]> {
+  // Broad query: man_made=pipeline covers most tagged pipelines; adding ways with
+  // any pipeline=* tag catches oil/gas lines tagged by substance rather than man_made.
   const query = `
-    [out:json][timeout:20];
-    way["man_made"="pipeline"](around:${radiusM},${lat},${lon});
+    [out:json][timeout:25];
+    (
+      way["man_made"="pipeline"](around:${radiusM},${lat},${lon});
+      way["pipeline"~"."](around:${radiusM},${lat},${lon});
+    );
     out geom;
   `;
   const data = await overpassFetch(query);
+  const seen = new Set<string>();
   const features: InfraFeature[] = [];
   for (const el of data.elements ?? []) {
     if (!el.geometry || el.geometry.length < 2) continue;
+    const id = String(el.id);
+    if (seen.has(id)) continue;
+    seen.add(id);
     const tags = el.tags ?? {};
-    const name = tags.name || tags.substance || "Pipeline";
+    const substance = tags.substance || tags.pipeline || "";
+    const name = tags.name || (substance ? `${substance} pipeline` : "Pipeline");
     const midIdx = Math.floor(el.geometry.length / 2);
     const mid = el.geometry[midIdx];
     const coords: [number,number][] = el.geometry.map((n:{lat:number;lon:number}) => [n.lat, n.lon] as [number,number]);
@@ -616,6 +626,27 @@ function latLonToLocal(lat:number,lon:number,refLat:number,refLon:number):[numbe
   return [dx,dy];
 }
 
+// ─── Stroke font for always-visible voltage labels ────────────────────────────
+// 3×5 unit cell per glyph. Segments are [x1,y1,x2,y2], y=0 bottom, y=5 top, midline at y=2.5.
+
+const GLYPHS: Record<string, [number,number,number,number][]> = {
+  '0': [[0,5,3,5],[0,0,0,5],[3,0,3,5],[0,0,3,0]],
+  '1': [[1.5,5,1.5,0]],
+  '2': [[0,5,3,5],[3,5,3,2.5],[0,2.5,3,2.5],[0,2.5,0,0],[0,0,3,0]],
+  '3': [[0,5,3,5],[3,5,3,0],[0,2.5,3,2.5],[0,0,3,0]],
+  '4': [[0,5,0,2.5],[0,2.5,3,2.5],[3,5,3,0]],
+  '5': [[0,5,3,5],[0,5,0,2.5],[0,2.5,3,2.5],[3,2.5,3,0],[0,0,3,0]],
+  '6': [[0,5,3,5],[0,5,0,0],[0,2.5,3,2.5],[3,2.5,3,0],[0,0,3,0]],
+  '7': [[0,5,3,5],[3,5,3,0]],
+  '8': [[0,5,3,5],[0,0,0,5],[3,0,3,5],[0,0,3,0],[0,2.5,3,2.5]],
+  '9': [[0,5,3,5],[0,5,0,2.5],[3,5,3,0],[0,2.5,3,2.5],[0,0,3,0]],
+  'k': [[0,5,0,0],[0,2.5,3,5],[0,2.5,3,0]],
+  'K': [[0,5,0,0],[0,2.5,3,5],[0,2.5,3,0]],
+  'V': [[0,5,1.5,0],[3,5,1.5,0]],
+  'v': [[0,5,1.5,0],[3,5,1.5,0]],
+  ' ': [],
+};
+
 export async function renderPowerOverlay(
   features: InfraFeature[], refLat: number, refLon: number,
   visibleTypes: Set<"substation"|"plant"|"line"|"pipeline">,
@@ -641,18 +672,16 @@ export async function renderPowerOverlay(
 
   function addSegment(
     x1: number, y1: number, x2: number, y2: number, z: number,
+    w: number,
     r: number, g: number, b: number, a: number
   ) {
     const dx = x2 - x1, dy = y2 - y1;
     const len = Math.sqrt(dx*dx + dy*dy);
     if (len < 0.1) return;
-    const nx = (-dy / len) * LINE_W / 2;
-    const ny = ( dx / len) * LINE_W / 2;
-    // quad corners: left-A, right-A, left-B, right-B
-    const lax = x1+nx, lay = y1+ny;
-    const rax = x1-nx, ray = y1-ny;
-    const lbx = x2+nx, lby = y2+ny;
-    const rbx = x2-nx, rby = y2-ny;
+    const nx = (-dy / len) * w / 2;
+    const ny = ( dx / len) * w / 2;
+    const lax=x1+nx, lay=y1+ny, rax=x1-nx, ray=y1-ny;
+    const lbx=x2+nx, lby=y2+ny, rbx=x2-nx, rby=y2-ny;
     vert(lax,lay,z, r,g,b,a); vert(rax,ray,z, r,g,b,a); vert(lbx,lby,z, r,g,b,a);
     vert(rax,ray,z, r,g,b,a); vert(rbx,rby,z, r,g,b,a); vert(lbx,lby,z, r,g,b,a);
   }
@@ -663,11 +692,34 @@ export async function renderPowerOverlay(
     vert(cx-h,cy-h,z, r,g,b,a); vert(cx+h,cy+h,z, r,g,b,a); vert(cx-h,cy+h,z, r,g,b,a);
   }
 
+  // Render a voltage string (e.g. "230kV") as stroke geometry centered on cx,cy
+  function addGlyphLabel(
+    cx: number, cy: number, z: number,
+    text: string, charH: number,
+    r: number, g: number, b: number, a: number
+  ) {
+    const scale   = charH / 5;          // 5 = glyph height in units
+    const sw      = Math.max(scale * 0.55, 1);
+    const advance = 4 * scale;
+    const totalW  = text.length * advance - scale;
+    let ox = cx - totalW / 2;
+    for (const ch of text) {
+      for (const [x1,y1,x2,y2] of (GLYPHS[ch] ?? [])) {
+        addSegment(
+          ox + x1*scale, cy + (y1-2.5)*scale,
+          ox + x2*scale, cy + (y2-2.5)*scale,
+          z, sw, r, g, b, a
+        );
+      }
+      ox += advance;
+    }
+  }
+
   if (visibleTypes.has("pipeline")) {
     for (const f of features.filter(f => f.type === "pipeline" && f.coords)) {
       const pts = f.coords!.map(([la, lo]) => latLonToLocal(la, lo, refLat, refLon));
       for (let i = 0; i < pts.length - 1; i++)
-        addSegment(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1], baseZ, 39, 174, 96, 200); // green
+        addSegment(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1], baseZ, LINE_W, 39, 174, 96, 200);
     }
   }
 
@@ -675,7 +727,16 @@ export async function renderPowerOverlay(
     for (const f of features.filter(f => f.type === "line" && f.coords)) {
       const pts = f.coords!.map(([la, lo]) => latLonToLocal(la, lo, refLat, refLon));
       for (let i = 0; i < pts.length - 1; i++)
-        addSegment(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1], baseZ, 231, 76, 60, 200);
+        addSegment(pts[i][0], pts[i][1], pts[i+1][0], pts[i+1][1], baseZ, LINE_W, 231, 76, 60, 200);
+    }
+    // Voltage labels at each line's midpoint — rendered above lines (baseZ+1)
+    const CHAR_H = 80;
+    for (const f of features.filter(f => f.type === "line")) {
+      const v = parseInt(f.voltage ?? "0");
+      if (!v) continue;
+      const kv = Math.round(v / 1000);
+      const [lx, ly] = latLonToLocal(f.lat, f.lon, refLat, refLon);
+      addGlyphLabel(lx, ly + CHAR_H * 0.9, baseZ + 1, `${kv}kV`, CHAR_H, 255, 255, 255, 230);
     }
   }
 
