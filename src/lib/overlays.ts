@@ -485,24 +485,19 @@ async function overpassFetch(query: string): Promise<any> {
   throw lastErr;
 }
 
-// Single combined OSM query: substations + plants + optional pipelines.
-// Keeping it one request avoids Overpass rate-limiting two simultaneous fetches.
-async function fetchOSMData(
-  lat: number, lon: number, radiusM: number, includePipelines: boolean,
+// Substations + plants — lightweight query, center point only (no geometry needed)
+async function fetchOSMSubstationsPlants(
+  lat: number, lon: number, radiusM: number,
 ): Promise<InfraFeature[]> {
-  const pipeClause = includePipelines
-    ? `way["man_made"="pipeline"](around:${radiusM},${lat},${lon});`
-    : "";
   const query = `
-    [out:json][timeout:25];
+    [out:json][timeout:20];
     (
       node["power"="substation"]["voltage"~"^[1-9]"](around:${radiusM},${lat},${lon});
       way["power"="substation"]["voltage"~"^[1-9]"](around:${radiusM},${lat},${lon});
       node["power"="plant"](around:${radiusM},${lat},${lon});
       way["power"="plant"](around:${radiusM},${lat},${lon});
-      ${pipeClause}
     );
-    out center geom;
+    out center;
   `;
   const data = await overpassFetch(query);
   const features: InfraFeature[] = [];
@@ -517,14 +512,32 @@ async function fetchOSMData(
       features.push({ type:"substation", name: name || `Substation (${voltage||"HV"})`, lat:clat, lon:clon, voltage });
     } else if (tags.power === "plant") {
       features.push({ type:"plant", name: name || "Power plant", lat:clat, lon:clon, fuel: tags["plant:source"] ?? tags.generator ?? "" });
-    } else if (tags.man_made === "pipeline" && el.geometry?.length >= 2) {
-      const substance = tags.substance || tags.pipeline || "";
-      const pname = tags.name || (substance ? `${substance} pipeline` : "Pipeline");
-      const midIdx = Math.floor(el.geometry.length / 2);
-      const mid = el.geometry[midIdx];
-      const coords: [number,number][] = el.geometry.map((n:{lat:number;lon:number}) => [n.lat, n.lon] as [number,number]);
-      features.push({ type:"pipeline", name:pname, lat:mid.lat ?? clat, lon:mid.lon ?? clon, coords });
     }
+  }
+  return features;
+}
+
+// Pipelines — separate query so it doesn't run in parallel with subs/plants
+// (simultaneous Overpass requests trigger rate-limiting)
+async function fetchOSMPipelines(
+  lat: number, lon: number, radiusM: number,
+): Promise<InfraFeature[]> {
+  const query = `
+    [out:json][timeout:25];
+    way["man_made"="pipeline"](around:${radiusM},${lat},${lon});
+    out geom;
+  `;
+  const data = await overpassFetch(query);
+  const features: InfraFeature[] = [];
+  for (const el of data.elements ?? []) {
+    if (!el.geometry || el.geometry.length < 2) continue;
+    const tags = el.tags ?? {};
+    const substance = tags.substance || "";
+    const name = tags.name || (substance ? `${substance} pipeline` : "Pipeline");
+    const midIdx = Math.floor(el.geometry.length / 2);
+    const mid = el.geometry[midIdx];
+    const coords: [number,number][] = el.geometry.map((n:{lat:number;lon:number}) => [n.lat, n.lon] as [number,number]);
+    features.push({ type:"pipeline", name, lat:mid.lat, lon:mid.lon, coords });
   }
   return features;
 }
@@ -572,11 +585,10 @@ export async function fetchPowerInfrastructure(
 ): Promise<InfraFeature[]> {
   onProgress?.("Querying power infrastructure…");
 
-  // Two parallel fetches: HIFLD (lines) + combined OSM (subs/plants/pipelines).
-  // Previously three fetches — simultaneous OSM requests triggered Overpass rate-limiting.
+  // Step 1: HIFLD (lines) + OSM subs/plants in parallel — different APIs, no conflict
   const [linesResult, osmResult] = await Promise.allSettled([
     fetchHIFLDLines(lat, lon, radiusM),
-    fetchOSMData(lat, lon, radiusM, includePipelines),
+    fetchOSMSubstationsPlants(lat, lon, radiusM),
   ]);
 
   const features: InfraFeature[] = [];
@@ -584,10 +596,17 @@ export async function fetchPowerInfrastructure(
   if (osmResult.status   === "fulfilled") features.push(...osmResult.value);
 
   // If we got no power features at all, fall back to full OSM query
-  if (features.filter(f => f.type !== "pipeline").length === 0) {
+  if (features.length === 0) {
     onProgress?.("Primary sources unavailable, trying OSM fallback…");
     const fallback = await fetchOSMAll(lat, lon, radiusM);
     features.push(...fallback);
+  }
+
+  // Step 2: pipelines run AFTER subs/plants — sequential avoids Overpass rate-limiting
+  if (includePipelines) {
+    onProgress?.("Querying pipeline data…");
+    const pipes = await fetchOSMPipelines(lat, lon, radiusM).catch(() => [] as InfraFeature[]);
+    features.push(...pipes);
   }
 
   const subs      = features.filter(f=>f.type==="substation").length;
