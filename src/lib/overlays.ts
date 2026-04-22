@@ -412,16 +412,23 @@ export type InfraFeature = {
   coords?: [number, number][];
 };
 
-// ─── HIFLD (primary) ─────────────────────────────────────────────────────────
+// ─── HIFLD transmission lines ────────────────────────────────────────────────
+// Only Electric_Power_Transmission_Lines is confirmed live at this org.
+// Substations and plants are fetched from OSM separately.
 
-const HIFLD = "https://services1.arcgis.com/Hp6G80Pky0om7QvQ/arcgis/rest/services";
+const HIFLD_LINES = "https://services1.arcgis.com/Hp6G80Pky0om7QvQ/arcgis/rest/services/Electric_Power_Transmission_Lines/FeatureServer/0/query";
 
-async function hifldQuery(service: string, bboxParam: string, fields: string): Promise<any> {
+async function fetchHIFLDLines(
+  lat: number, lon: number, radiusM: number,
+): Promise<InfraFeature[]> {
+  const latD = radiusM / 111320;
+  const lonD = radiusM / (111320 * Math.cos(lat * Math.PI / 180));
+  const bbox = JSON.stringify({ xmin: lon-lonD, ymin: lat-latD, xmax: lon+lonD, ymax: lat+latD });
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 30000);
-  const url = `${HIFLD}/${service}/FeatureServer/0/query?` +
-    `geometry=${bboxParam}&geometryType=esriGeometryEnvelope&inSR=4326` +
-    `&spatialRel=esriSpatialRelIntersects&outFields=${fields}` +
+  const timer = setTimeout(() => ctrl.abort(), 25000);
+  const url = `${HIFLD_LINES}?where=STATUS%3D'IN+SERVICE'` +
+    `&geometry=${encodeURIComponent(bbox)}&geometryType=esriGeometryEnvelope&inSR=4326` +
+    `&spatialRel=esriSpatialRelIntersects&outFields=VOLTAGE,VOLT_CLASS,SUB_1,SUB_2` +
     `&returnGeometry=true&outSR=4326&f=json`;
   try {
     const resp = await fetch(url, { signal: ctrl.signal });
@@ -429,71 +436,28 @@ async function hifldQuery(service: string, bboxParam: string, fields: string): P
     if (!resp.ok) throw new Error(`HIFLD HTTP ${resp.status}`);
     const json = await resp.json();
     if (json.error) throw new Error(`HIFLD: ${json.error.message}`);
-    return json;
+    const features: InfraFeature[] = [];
+    for (const f of json.features ?? []) {
+      const paths: number[][][] = f.geometry?.paths ?? [];
+      if (!paths.length || paths[0].length < 2) continue;
+      const path = paths[0];
+      const mid  = path[Math.floor(path.length / 2)];
+      const kv   = parseFloat(f.attributes?.VOLTAGE ?? "");
+      const s1   = (f.attributes?.SUB_1 ?? "").replace(/^(TAP|UNKNOWN)\d+$/i, "");
+      const s2   = (f.attributes?.SUB_2 ?? "").replace(/^(TAP|UNKNOWN)\d+$/i, "");
+      const name = (s1 && s2) ? `${s1} → ${s2}` : (kv ? `${kv}kV Line` : f.attributes?.VOLT_CLASS || "Transmission line");
+      features.push({
+        type: "line", name,
+        lat: mid[1], lon: mid[0],
+        voltage: kv ? String(Math.round(kv * 1000)) : "",
+        coords: path.map((pt: number[]) => [pt[1], pt[0]] as [number, number]),
+      });
+    }
+    return features;
   } catch (e) { clearTimeout(timer); throw e; }
 }
 
-async function fetchHIFLDPower(
-  lat: number, lon: number, radiusM: number,
-  onProgress?: (msg: string) => void
-): Promise<InfraFeature[]> {
-  const latD = radiusM / 111320;
-  const lonD = radiusM / (111320 * Math.cos(lat * Math.PI / 180));
-  const bboxParam = encodeURIComponent(JSON.stringify({
-    xmin: lon - lonD, ymin: lat - latD, xmax: lon + lonD, ymax: lat + latD,
-  }));
-
-  onProgress?.("Querying HIFLD power infrastructure…");
-  const [subData, lineData, plantData] = await Promise.all([
-    hifldQuery("Electric_Substations",            bboxParam, "NAME,VOLTAGE,TYPE"),
-    hifldQuery("Electric_Power_Transmission_Lines", bboxParam, "VOLTAGE,NAME"),
-    hifldQuery("Power_Plants",                    bboxParam, "NAME,PRIMSOURCE"),
-  ]);
-
-  const features: InfraFeature[] = [];
-
-  for (const f of subData.features ?? []) {
-    const g = f.geometry;
-    if (!g?.x) continue;
-    const kv = parseFloat(f.attributes?.VOLTAGE ?? "");
-    features.push({
-      type: "substation",
-      name: f.attributes?.NAME || (kv ? `${kv}kV Substation` : "Substation"),
-      lat: g.y, lon: g.x,
-      voltage: kv ? String(Math.round(kv * 1000)) : "",
-    });
-  }
-
-  for (const f of lineData.features ?? []) {
-    const paths: number[][][] = f.geometry?.paths ?? [];
-    if (!paths.length || paths[0].length < 2) continue;
-    const path = paths[0];
-    const mid  = path[Math.floor(path.length / 2)];
-    const kv   = parseFloat(f.attributes?.VOLTAGE ?? "");
-    features.push({
-      type: "line",
-      name: f.attributes?.NAME || (kv ? `${kv}kV Transmission` : "Transmission line"),
-      lat: mid[1], lon: mid[0],
-      voltage: kv ? String(Math.round(kv * 1000)) : "",
-      coords: path.map((pt: number[]) => [pt[1], pt[0]] as [number, number]),
-    });
-  }
-
-  for (const f of plantData.features ?? []) {
-    const g = f.geometry;
-    if (!g?.x) continue;
-    features.push({
-      type: "plant",
-      name: f.attributes?.NAME || "Power plant",
-      lat: g.y, lon: g.x,
-      fuel: f.attributes?.PRIMSOURCE ?? "",
-    });
-  }
-
-  return features;
-}
-
-// ─── OSM Overpass (fallback) ──────────────────────────────────────────────────
+// ─── OSM Overpass ─────────────────────────────────────────────────────────────
 
 const OVERPASS_ENDPOINTS = [
   "https://overpass-api.de/api/interpreter",
@@ -507,7 +471,7 @@ async function overpassFetch(query: string): Promise<any> {
   for (const endpoint of OVERPASS_ENDPOINTS) {
     try {
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 30000);
+      const timer = setTimeout(() => ctrl.abort(), 25000);
       const resp = await fetch(endpoint, { method: "POST", headers, body, signal: ctrl.signal });
       clearTimeout(timer);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -517,16 +481,47 @@ async function overpassFetch(query: string): Promise<any> {
   throw lastErr;
 }
 
-async function fetchOSMPower(
+// Substations + plants only — no lines (HIFLD handles those), keeps query fast
+async function fetchOSMSubstationsPlants(
   lat: number, lon: number, radiusM: number,
-  onProgress?: (msg: string) => void
 ): Promise<InfraFeature[]> {
-  onProgress?.("Querying OpenStreetMap (fallback)…");
+  const query = `
+    [out:json][timeout:20];
+    (
+      node["power"="substation"]["voltage"~"^[1-9]"](around:${radiusM},${lat},${lon});
+      way["power"="substation"]["voltage"~"^[1-9]"](around:${radiusM},${lat},${lon});
+      node["power"="plant"](around:${radiusM},${lat},${lon});
+      way["power"="plant"](around:${radiusM},${lat},${lon});
+    );
+    out center;
+  `;
+  const data = await overpassFetch(query);
+  const features: InfraFeature[] = [];
+  for (const el of data.elements ?? []) {
+    const clat = el.lat ?? el.center?.lat;
+    const clon = el.lon ?? el.center?.lon;
+    if (!clat || !clon) continue;
+    const tags  = el.tags ?? {};
+    const name  = tags.name || tags["name:en"] || "";
+    const voltage = tags.voltage ?? "";
+    if (tags.power === "substation") {
+      features.push({ type:"substation", name: name || `Substation (${voltage||"HV"})`, lat:clat, lon:clon, voltage });
+    } else if (tags.power === "plant") {
+      features.push({ type:"plant", name: name || "Power plant", lat:clat, lon:clon, fuel: tags["plant:source"] ?? tags.generator ?? "" });
+    }
+  }
+  return features;
+}
+
+// Full OSM fallback (lines + subs + plants) used only when both primary sources fail
+async function fetchOSMAll(
+  lat: number, lon: number, radiusM: number,
+): Promise<InfraFeature[]> {
   const query = `
     [out:json][timeout:25];
     (
-      node["power"="substation"]["voltage"~"^[0-9]"](around:${radiusM},${lat},${lon});
-      way["power"="substation"]["voltage"~"^[0-9]"](around:${radiusM},${lat},${lon});
+      node["power"="substation"]["voltage"~"^[1-9]"](around:${radiusM},${lat},${lon});
+      way["power"="substation"]["voltage"~"^[1-9]"](around:${radiusM},${lat},${lon});
       node["power"="plant"](around:${radiusM},${lat},${lon});
       way["power"="plant"](around:${radiusM},${lat},${lon});
       way["power"="line"]["voltage"~"^[1-9][0-9]{4,}"](around:${radiusM},${lat},${lon});
@@ -539,15 +534,14 @@ async function fetchOSMPower(
     const clat = el.lat ?? el.center?.lat;
     const clon = el.lon ?? el.center?.lon;
     if (!clat || !clon) continue;
-    const tags    = el.tags ?? {};
-    const power   = tags.power;
-    const name    = tags.name || tags["name:en"] || "";
+    const tags  = el.tags ?? {};
+    const name  = tags.name || tags["name:en"] || "";
     const voltage = tags.voltage ?? "";
-    if (power === "substation") {
-      features.push({ type:"substation", name: name || `Substation (${voltage?voltage+"V":"HV"})`, lat:clat, lon:clon, voltage });
-    } else if (power === "plant") {
-      features.push({ type:"plant", name: name || "Power plant", lat:clat, lon:clon, fuel: tags.generator ?? tags["plant:source"] ?? "" });
-    } else if (power === "line" && el.geometry) {
+    if (tags.power === "substation") {
+      features.push({ type:"substation", name: name || `Substation (${voltage||"HV"})`, lat:clat, lon:clon, voltage });
+    } else if (tags.power === "plant") {
+      features.push({ type:"plant", name: name || "Power plant", lat:clat, lon:clon, fuel: tags["plant:source"] ?? tags.generator ?? "" });
+    } else if (tags.power === "line" && el.geometry) {
       const coords: [number,number][] = el.geometry.map((n:{lat:number;lon:number}) => [n.lat, n.lon] as [number,number]);
       if (coords.length >= 2) features.push({ type:"line", name: name || `${voltage?voltage+"V ":""}Transmission line`, lat:clat, lon:clon, voltage, coords });
     }
@@ -559,16 +553,30 @@ export async function fetchPowerInfrastructure(
   lat: number, lon: number, radiusM = 40000,
   onProgress?: (msg: string) => void
 ): Promise<InfraFeature[]> {
-  try {
-    const features = await fetchHIFLDPower(lat, lon, radiusM, onProgress);
-    onProgress?.(`Found ${features.filter(f=>f.type==="substation").length} substations, ${features.filter(f=>f.type==="plant").length} plants, ${features.filter(f=>f.type==="line").length} lines`);
-    return features;
-  } catch {
-    onProgress?.("HIFLD unavailable, trying OpenStreetMap…");
-    const features = await fetchOSMPower(lat, lon, radiusM, onProgress);
-    onProgress?.(`Found ${features.filter(f=>f.type==="substation").length} substations, ${features.filter(f=>f.type==="plant").length} plants, ${features.filter(f=>f.type==="line").length} lines`);
-    return features;
+  onProgress?.("Querying power infrastructure…");
+
+  // HIFLD lines + OSM subs/plants run in parallel — each can fail independently
+  const [linesResult, osmResult] = await Promise.allSettled([
+    fetchHIFLDLines(lat, lon, radiusM),
+    fetchOSMSubstationsPlants(lat, lon, radiusM),
+  ]);
+
+  const features: InfraFeature[] = [];
+  if (linesResult.status === "fulfilled") features.push(...linesResult.value);
+  if (osmResult.status   === "fulfilled") features.push(...osmResult.value);
+
+  // If we got nothing at all, fall back to full OSM query
+  if (features.length === 0) {
+    onProgress?.("Primary sources unavailable, trying OSM fallback…");
+    const fallback = await fetchOSMAll(lat, lon, radiusM);
+    features.push(...fallback);
   }
+
+  const subs   = features.filter(f=>f.type==="substation").length;
+  const plants = features.filter(f=>f.type==="plant").length;
+  const lines  = features.filter(f=>f.type==="line").length;
+  onProgress?.(`Found ${subs} substations, ${plants} plants, ${lines} lines`);
+  return features;
 }
 
 function latLonToLocal(lat:number,lon:number,refLat:number,refLon:number):[number,number] {
