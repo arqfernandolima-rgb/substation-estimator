@@ -530,18 +530,20 @@ async function fetchOSMSubstationsPlants(
   return features;
 }
 
-// Runs on secondary endpoint (kumi.systems first) so it doesn't compete with
-// fetchOSMSubstationsPlants when both run in parallel.
+// GET request (not POST) to avoid any CSP/preflight issues in the Forma iframe.
+// Capped at 16km radius so the geometry response stays small.
 async function fetchOSMPipelines(
   lat: number, lon: number, radiusM: number,
 ): Promise<InfraFeature[]> {
-  const bb = osmBbox(lat, lon, radiusM);
-  const query = `
-    [out:json][timeout:25];
-    way["man_made"="pipeline"](${bb});
-    out geom;
-  `;
-  const data = await overpassFetch(query, true);
+  const bb = osmBbox(lat, lon, Math.min(radiusM, 16_000));
+  const query = `[out:json][timeout:20];way["man_made"="pipeline"](${bb});out geom;`;
+  const url = `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 22_000);
+  const resp = await fetch(url, { signal: ctrl.signal });
+  clearTimeout(timer);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const data = await resp.json();
   const features: InfraFeature[] = [];
   for (const el of data.elements ?? []) {
     if (!el.geometry || el.geometry.length < 2) continue;
@@ -600,25 +602,33 @@ export async function fetchPowerInfrastructure(
 ): Promise<InfraFeature[]> {
   onProgress?.("Querying power infrastructure…");
 
-  // All three run in parallel: HIFLD on its own server, OSM subs/plants on
-  // overpass-api.de, pipelines on overpass.kumi.systems — no server sees two
-  // simultaneous requests, no rate-limiting.
-  const [linesResult, osmResult, pipeResult] = await Promise.allSettled([
+  // HIFLD (its own CDN) + OSM subs/plants run in parallel.
+  // Pipelines run sequentially after — both go to overpass-api.de so
+  // simultaneous requests trigger HTTP 429.
+  const [linesResult, osmResult] = await Promise.allSettled([
     fetchHIFLDLines(lat, lon, radiusM),
     fetchOSMSubstationsPlants(lat, lon, radiusM),
-    includePipelines ? fetchOSMPipelines(lat, lon, radiusM) : Promise.resolve([] as InfraFeature[]),
   ]);
 
   const features: InfraFeature[] = [];
   if (linesResult.status === "fulfilled") features.push(...linesResult.value);
   if (osmResult.status   === "fulfilled") features.push(...osmResult.value);
-  if (pipeResult.status  === "fulfilled") features.push(...pipeResult.value);
 
   // If we got no power features at all, fall back to full OSM query
-  if (features.filter(f => f.type !== "pipeline").length === 0) {
+  if (features.length === 0) {
     onProgress?.("Primary sources unavailable, trying OSM fallback…");
     const fallback = await fetchOSMAll(lat, lon, radiusM);
     features.push(...fallback);
+  }
+
+  if (includePipelines) {
+    onProgress?.("Querying pipelines…");
+    try {
+      const pipes = await fetchOSMPipelines(lat, lon, radiusM);
+      features.push(...pipes);
+    } catch (e) {
+      console.warn("Pipeline fetch failed:", e);
+    }
   }
 
   const subs      = features.filter(f=>f.type==="substation").length;
