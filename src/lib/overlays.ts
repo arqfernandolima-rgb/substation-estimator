@@ -71,6 +71,11 @@ let slopeMeshCache: SlopeMeshCache | null = null;
 
 export function clearTerrainCache() { terrainCache = null; slopeMeshCache = null; }
 
+export async function getSceneDiagonal(): Promise<number> {
+  const { minX, maxX, minY, maxY } = await getTerrainData();
+  return Math.sqrt((maxX - minX) ** 2 + (maxY - minY) ** 2);
+}
+
 // ─── Slope overlay render (Gouraud mesh) ─────────────────────────────────────
 
 export async function renderSlopeOverlay(

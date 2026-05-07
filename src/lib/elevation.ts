@@ -1,6 +1,8 @@
 // Spot elevation check: click a point → read terrain elevation → render a pin + label in the scene.
 // Uses Forma.designTool.getPoint() for the pick interaction and terrain.getElevationAt() for the value.
 
+import { getSceneDiagonal } from "./overlays";
+
 export type ElevPin = {
   id:     number;
   x:      number;
@@ -32,7 +34,9 @@ const GLYPHS: Record<string, [number, number, number, number][]> = {
 
 let _nextId = 0;
 
-function buildPinGeometry(x: number, y: number, elevM: number, elevFt: number) {
+// sceneDiag is the terrain bounding-box diagonal in meters, used to scale markers and labels
+// proportionally so they read well at any site size.
+function buildPinGeometry(x: number, y: number, elevM: number, elevFt: number, sceneDiag: number) {
   const positions: number[] = [];
   const colorArr:  number[] = [];
 
@@ -75,23 +79,25 @@ function buildPinGeometry(x: number, y: number, elevM: number, elevFt: number) {
     }
   }
 
-  const markerZ = elevM + 1.0;  // 1 m above terrain surface, clears the 0.5 m slope mesh lift
-  const labelZ  = elevM + 8.0;  // floating label above pin
-  const HALF    = 4;             // half-size of square marker (meters)
-  const CHAR_H  = 24;            // glyph height (meters)
+  // Scale marker and label proportionally to site/terrain size so they read
+  // well at any zoom level without dominating small sites or vanishing on large ones.
+  const HALF   = Math.max(2, Math.min(10, sceneDiag * 0.010));  // marker half-size (m)
+  const CHAR_H = Math.max(3, Math.min(16, sceneDiag * 0.020));  // glyph height (m)
+  const markerZ = elevM + Math.max(0.5, HALF * 0.25);           // clears slope mesh lift
+  const labelZ  = elevM + CHAR_H * 1.5;                          // floating above pin
 
   // Orange filled square ground marker
   vert(x-HALF,y-HALF,markerZ, 255,140,0,230); vert(x+HALF,y-HALF,markerZ, 255,140,0,230); vert(x+HALF,y+HALF,markerZ, 255,140,0,230);
   vert(x-HALF,y-HALF,markerZ, 255,140,0,230); vert(x+HALF,y+HALF,markerZ, 255,140,0,230); vert(x-HALF,y+HALF,markerZ, 255,140,0,230);
 
-  // White crosshair on top of marker
-  addSegment(x - HALF*2.5, y, x + HALF*2.5, y, markerZ+0.1, 1.5, 255,255,255,200);
-  addSegment(x, y - HALF*2.5, x, y + HALF*2.5, markerZ+0.1, 1.5, 255,255,255,200);
+  // Dark crosshair on top of marker
+  addSegment(x - HALF*2.5, y, x + HALF*2.5, y, markerZ+0.1, 1.2, 60,60,60,200);
+  addSegment(x, y - HALF*2.5, x, y + HALF*2.5, markerZ+0.1, 1.2, 60,60,60,200);
 
-  // Floating elevation label e.g. "342.8ft"
+  // Floating elevation label e.g. "342.8ft" in dark grey
   const sign  = elevFt < 0 ? '-' : '';
   const label = sign + Math.abs(elevFt).toFixed(1) + 'ft';
-  addGlyph(x, y, labelZ, label, CHAR_H, 255, 255, 255, 240);
+  addGlyph(x, y, labelZ, label, CHAR_H, 65, 65, 65, 245);
 
   return {
     position: new Float32Array(positions),
@@ -101,14 +107,19 @@ function buildPinGeometry(x: number, y: number, elevM: number, elevFt: number) {
 
 export async function pickElevationPoint(): Promise<ElevPin | null> {
   const { Forma } = await import("forma-embedded-view-sdk/auto");
-  const point = await Forma.designTool.getPoint();
+
+  // Warm the terrain cache in parallel while waiting for the user to click a point.
+  const [point, sceneDiag] = await Promise.all([
+    Forma.designTool.getPoint(),
+    getSceneDiagonal().catch(() => 300),
+  ]);
   if (!point) return null;  // user pressed ESC
 
   const elevM  = await Forma.terrain.getElevationAt({ x: point.x, y: point.y });
   const elevFt = elevM * 3.28084;
   const id     = ++_nextId;
 
-  const geometryData = buildPinGeometry(point.x, point.y, elevM, elevFt);
+  const geometryData = buildPinGeometry(point.x, point.y, elevM, elevFt, sceneDiag);
   const { id: meshId } = await Forma.render.addMesh({ geometryData });
   return { id, x: point.x, y: point.y, elevM, elevFt, meshId };
 }
