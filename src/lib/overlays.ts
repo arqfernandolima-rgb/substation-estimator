@@ -69,7 +69,17 @@ type SlopeMeshCache = {
 
 let slopeMeshCache: SlopeMeshCache | null = null;
 
-export function clearTerrainCache() { terrainCache = null; slopeMeshCache = null; }
+type ElevMeshCache = {
+  positions:     Float32Array;
+  elevPerVertex: Float32Array;
+  minZ:          number;
+  maxZ:          number;
+  meshId:        string | null;
+};
+
+let elevBandMeshCache: ElevMeshCache | null = null;
+
+export function clearTerrainCache() { terrainCache = null; slopeMeshCache = null; elevBandMeshCache = null; }
 
 export async function getSceneDiagonal(): Promise<number> {
   const { minX, maxX, minY, maxY } = await getTerrainData();
@@ -188,6 +198,114 @@ export async function removeSlopeOverlay(): Promise<void> {
     slopeMeshCache.meshId = null;
   }
   slopeMeshCache = null;
+}
+
+// ─── Elevation banding overlay ────────────────────────────────────────────────
+// Colors the terrain mesh by elevation using Gouraud per-vertex shading.
+// Six bands auto-scaled to the actual terrain min/max (green → red, low → high).
+
+export const ELEV_BAND_DEFS = [
+  { color: "#1a9850", rgb: [26,  152, 80 ] },
+  { color: "#91cf60", rgb: [145, 207, 96 ] },
+  { color: "#d9ef8b", rgb: [217, 239, 139] },
+  { color: "#fee08b", rgb: [254, 224, 139] },
+  { color: "#fc8d59", rgb: [252, 141, 89 ] },
+  { color: "#d7191c", rgb: [215, 25,  28 ] },
+] as const;
+
+export type ElevBandResult = { minFt: number; maxFt: number; color: string };
+
+function elevToRgb(z: number, minZ: number, maxZ: number) {
+  const N   = ELEV_BAND_DEFS.length;
+  const t   = maxZ > minZ ? Math.min(1, (z - minZ) / (maxZ - minZ)) : 0;
+  const idx = Math.min(N - 1, Math.floor(t * N));
+  return ELEV_BAND_DEFS[idx].rgb;
+}
+
+async function pushElevBandMesh(Forma: any, opacity: number): Promise<void> {
+  if (!elevBandMeshCache) return;
+  const { positions, elevPerVertex, minZ, maxZ } = elevBandMeshCache;
+  const alpha  = Math.round(opacity * 255);
+  const colors = new Uint8Array(elevPerVertex.length * 4);
+  for (let i = 0; i < elevPerVertex.length; i++) {
+    const rgb = elevToRgb(elevPerVertex[i], minZ, maxZ);
+    colors[i*4]   = rgb[0];
+    colors[i*4+1] = rgb[1];
+    colors[i*4+2] = rgb[2];
+    colors[i*4+3] = alpha;
+  }
+  const geometryData = { position: positions, color: colors };
+  if (elevBandMeshCache.meshId) {
+    await Forma.render.updateMesh({ id: elevBandMeshCache.meshId, geometryData });
+  } else {
+    const { id } = await Forma.render.addMesh({ geometryData });
+    elevBandMeshCache.meshId = id;
+  }
+}
+
+export async function renderElevationOverlay(
+  onProgress: (msg: string) => void,
+  opacity: number
+): Promise<ElevBandResult[]> {
+  const { Forma } = await import("forma-embedded-view-sdk/auto");
+
+  if (!elevBandMeshCache) {
+    onProgress("Reading terrain mesh…");
+    const { triangles, minZ, maxZ } = await getTerrainData();
+    onProgress("Computing elevation bands…");
+
+    const posList:  number[] = [];
+    const elevList: number[] = [];
+
+    for (let i = 0; i < triangles.length; i += 9) {
+      const x1=triangles[i],   y1=triangles[i+1], z1=triangles[i+2];
+      const x2=triangles[i+3], y2=triangles[i+4], z2=triangles[i+5];
+      const x3=triangles[i+6], y3=triangles[i+7], z3=triangles[i+8];
+
+      // Skip wall triangles (same threshold as slope overlay)
+      const ex1=x2-x1, ey1=y2-y1, ez1=z2-z1;
+      const ex2=x3-x1, ey2=y3-y1, ez2=z3-z1;
+      const nx=ey1*ez2-ez1*ey2, ny=ez1*ex2-ex1*ez2, nz_=ex1*ey2-ey1*ex2;
+      const nLen=Math.sqrt(nx*nx+ny*ny+nz_*nz_);
+      if (nLen < 1e-10 || Math.abs(nz_)/nLen < 0.2) continue;
+
+      for (const [vx,vy,vz] of [[x1,y1,z1],[x2,y2,z2],[x3,y3,z3]]) {
+        posList.push(vx, vy, vz + 0.5);
+        elevList.push(vz);
+      }
+    }
+
+    elevBandMeshCache = {
+      positions:     new Float32Array(posList),
+      elevPerVertex: new Float32Array(elevList),
+      minZ, maxZ, meshId: null,
+    };
+  }
+
+  onProgress("Rendering…");
+  await pushElevBandMesh(Forma, opacity);
+  onProgress("done");
+
+  const { minZ, maxZ } = elevBandMeshCache;
+  const bandM = (maxZ - minZ) / ELEV_BAND_DEFS.length;
+  return ELEV_BAND_DEFS.map((b, i) => ({
+    minFt: Math.round((minZ + i * bandM) * 3.28084),
+    maxFt: Math.round((minZ + (i + 1) * bandM) * 3.28084),
+    color: b.color,
+  }));
+}
+
+export async function updateElevationOpacity(opacity: number): Promise<void> {
+  if (!elevBandMeshCache?.meshId) return;
+  const { Forma } = await import("forma-embedded-view-sdk/auto");
+  await pushElevBandMesh(Forma, opacity);
+}
+
+export async function removeElevationOverlay(): Promise<void> {
+  if (!elevBandMeshCache?.meshId) return;
+  const { Forma } = await import("forma-embedded-view-sdk/auto");
+  try { await Forma.render.remove({ id: elevBandMeshCache.meshId }); } catch {}
+  elevBandMeshCache = null;
 }
 
 // ─── Contour / topo lines overlay ────────────────────────────────────────────

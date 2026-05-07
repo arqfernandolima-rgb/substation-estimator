@@ -4,9 +4,10 @@ declare const __APP_VERSION__: string;
 import {
   SLOPE_BANDS,
   renderSlopeOverlay, removeSlopeOverlay, updateSlopeOpacity,
+  renderElevationOverlay, removeElevationOverlay, updateElevationOpacity,
   fetchPowerInfrastructure, renderPowerOverlay, removePowerOverlay,
   clearTerrainCache,
-  type InfraFeature,
+  type InfraFeature, type ElevBandResult,
 } from "./lib/overlays";
 import {
   type ElevPin,
@@ -37,8 +38,12 @@ export default function OverlaysApp() {
   const [infraStats,   setInfraStats]   = useState<{subs:number;plants:number;lines:number;pipelines:number}|null>(null);
   const [refLatLon,    setRefLatLon]    = useState<[number,number]|null>(null);
   const [radiusMi,     setRadiusMi]     = useState(25);
-  const [elevPins,     setElevPins]     = useState<ElevPin[]>([]);
-  const [elevPicking,  setElevPicking]  = useState(false);
+  const [elevBandState,   setElevBandState]   = useState<OverlayState>("off");
+  const [elevBandMsg,     setElevBandMsg]     = useState("");
+  const [elevBandOpacity, setElevBandOpacity] = useState(0.80);
+  const [elevBands,       setElevBands]       = useState<ElevBandResult[]>([]);
+  const [elevPins,        setElevPins]        = useState<ElevPin[]>([]);
+  const [elevPicking,     setElevPicking]     = useState(false);
 
   useEffect(() => {
     if (!IS_IN_FORMA) { setRefLatLon([35.732, -78.823]); return; }
@@ -147,6 +152,42 @@ export default function OverlaysApp() {
     if(powerState==="on"){removePowerOverlay().catch(()=>{});setPowerState("off");}
   };
 
+  // ── Elevation banding ─────────────────────────────────────────────────────
+  const toggleElevBand = useCallback(async () => {
+    if (elevBandState === "loading") return;
+    if (elevBandState === "on") {
+      await removeElevationOverlay().catch(()=>{});
+      setElevBandState("off"); setElevBandMsg(""); setElevBands([]); return;
+    }
+    setElevBandState("loading"); setElevBandMsg("Starting…");
+    try {
+      if (!IS_IN_FORMA) {
+        await new Promise(r => setTimeout(r, 600));
+        setElevBandState("on"); setElevBandMsg("");
+        setElevBands([
+          {minFt:300,maxFt:310,color:"#1a9850"},{minFt:310,maxFt:320,color:"#91cf60"},
+          {minFt:320,maxFt:330,color:"#d9ef8b"},{minFt:330,maxFt:340,color:"#fee08b"},
+          {minFt:340,maxFt:350,color:"#fc8d59"},{minFt:350,maxFt:360,color:"#d7191c"},
+        ]); return;
+      }
+      const bands = await renderElevationOverlay(msg => {
+        if (msg==="done"){setElevBandState("on");setElevBandMsg("");}
+        else setElevBandMsg(msg);
+      }, elevBandOpacity);
+      setElevBands(bands);
+    } catch(e) {
+      setElevBandState("error"); setElevBandMsg(String(e).substring(0,140));
+    }
+  }, [elevBandState, elevBandOpacity]);
+
+  const elevBandOpacityTimer = useRef<ReturnType<typeof setTimeout>|null>(null);
+  const handleElevBandOpacity = (v: number) => {
+    setElevBandOpacity(v);
+    if (elevBandState !== "on") return;
+    if (elevBandOpacityTimer.current) clearTimeout(elevBandOpacityTimer.current);
+    elevBandOpacityTimer.current = setTimeout(() => updateElevationOpacity(v).catch(()=>{}), 80);
+  };
+
   // ── Elevation ─────────────────────────────────────────────────────────────
   const handlePickElev = useCallback(async () => {
     if (elevPicking) return;
@@ -181,7 +222,7 @@ export default function OverlaysApp() {
       {/* Header */}
       <div style={{padding:"12px 14px 10px",borderBottom:`1px solid ${T.border}`}}>
         <div style={{fontSize:14,fontWeight:600,color:T.tx1}}>Site Overlays</div>
-        <div style={{fontSize:11,color:T.tx3,marginTop:2}}>Slope · Elevation · Power infrastructure</div>
+        <div style={{fontSize:11,color:T.tx3,marginTop:2}}>Slope · Elevation · Power infrastructure · Spot elevation</div>
       </div>
 
       <div style={{padding:"10px 14px",display:"flex",flexDirection:"column",gap:10}}>
@@ -203,6 +244,28 @@ export default function OverlaysApp() {
                 </div>
               ))}
             </div>
+          </>
+        </OverlayCard>
+
+        {/* ── Elevation Banding ──────────────────────────────────────────── */}
+        <OverlayCard title="Elevation banding" iconColor="#1a9850"
+          state={elevBandState} msg={elevBandMsg} onToggle={toggleElevBand} activeColor="#1a9850"
+          description="Terrain mesh colored by elevation, auto-scaled to site range.">
+          <>
+            <div style={{marginTop:10,paddingTop:10,borderTop:`1px solid ${T.border}`}}>
+              <OpacitySlider label="Opacity" value={elevBandOpacity} onChange={handleElevBandOpacity} color="#1a9850"/>
+            </div>
+            {elevBands.length > 0 && (
+              <div style={{marginTop:8}}>
+                <div style={{fontSize:10,fontWeight:600,color:T.tx3,textTransform:"uppercase",letterSpacing:.5,marginBottom:5}}>Color legend</div>
+                {elevBands.map((band,i) => (
+                  <div key={i} style={{display:"flex",alignItems:"center",gap:7,marginBottom:3}}>
+                    <div style={{width:14,height:14,borderRadius:2,flexShrink:0,background:band.color,border:"1px solid rgba(0,0,0,.08)"}}/>
+                    <span style={{fontSize:11,color:T.tx2}}>{band.minFt}–{band.maxFt} ft</span>
+                  </div>
+                ))}
+              </div>
+            )}
           </>
         </OverlayCard>
 

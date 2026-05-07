@@ -81,8 +81,8 @@ function buildPinGeometry(x: number, y: number, elevM: number, elevFt: number, s
 
   // Scale marker and label proportionally to site/terrain size so they read
   // well at any zoom level without dominating small sites or vanishing on large ones.
-  const HALF   = Math.max(1.5, Math.min(8,  sceneDiag * 0.008));  // marker half-size (m)
-  const CHAR_H = Math.max(2,   Math.min(13, sceneDiag * 0.016));  // glyph height (m)
+  const HALF   = Math.max(1.2, Math.min(6.5, sceneDiag * 0.0064));  // marker half-size (m)
+  const CHAR_H = Math.max(1.6, Math.min(10,  sceneDiag * 0.013));  // glyph height (m)
   const markerZ = elevM + Math.max(0.5, HALF * 0.25);           // clears slope mesh lift
   const labelZ  = elevM + CHAR_H * 1.5;                          // floating above pin
 
