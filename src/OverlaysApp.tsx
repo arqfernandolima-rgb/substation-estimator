@@ -241,7 +241,6 @@ export default function OverlaysApp() {
                     <span style={{flex:1,fontSize:11,color:T.tx1,fontWeight:500}}>
                       Pin {i+1}: {pin.elevFt.toFixed(1)} ft
                     </span>
-                    <span style={{fontSize:10,color:T.tx3}}>{pin.elevM.toFixed(1)} m</span>
                     <button onClick={() => handleRemovePin(pin)}
                       style={{fontSize:12,color:T.tx3,background:"none",border:"none",
                         cursor:"pointer",padding:"0 2px",lineHeight:1,marginLeft:2}}>
