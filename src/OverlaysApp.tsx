@@ -8,6 +8,10 @@ import {
   clearTerrainCache,
   type InfraFeature,
 } from "./lib/overlays";
+import {
+  type ElevPin,
+  pickElevationPoint, removeElevationPin, clearAllElevationPins,
+} from "./lib/elevation";
 
 const T = {
   border:"#e2e2e2", tx1:"#1a1a1a", tx2:"#555", tx3:"#999",
@@ -33,6 +37,8 @@ export default function OverlaysApp() {
   const [infraStats,   setInfraStats]   = useState<{subs:number;plants:number;lines:number;pipelines:number}|null>(null);
   const [refLatLon,    setRefLatLon]    = useState<[number,number]|null>(null);
   const [radiusMi,     setRadiusMi]     = useState(25);
+  const [elevPins,     setElevPins]     = useState<ElevPin[]>([]);
+  const [elevPicking,  setElevPicking]  = useState(false);
 
   useEffect(() => {
     if (!IS_IN_FORMA) { setRefLatLon([35.732, -78.823]); return; }
@@ -141,6 +147,33 @@ export default function OverlaysApp() {
     if(powerState==="on"){removePowerOverlay().catch(()=>{});setPowerState("off");}
   };
 
+  // ── Elevation ─────────────────────────────────────────────────────────────
+  const handlePickElev = useCallback(async () => {
+    if (elevPicking) return;
+    setElevPicking(true);
+    try {
+      if (!IS_IN_FORMA) {
+        await new Promise(r => setTimeout(r, 800));
+        setElevPins(prev => [...prev, { id: Date.now(), x: 0, y: 0, elevM: 104.5, elevFt: 342.8, meshId: null }]);
+        return;
+      }
+      const pin = await pickElevationPoint();
+      if (pin) setElevPins(prev => [...prev, pin]);
+    } catch { /* user cancelled or SDK error */ }
+    finally { setElevPicking(false); }
+  }, [elevPicking]);
+
+  const handleRemovePin = useCallback(async (pin: ElevPin) => {
+    setElevPins(prev => prev.filter(p => p.id !== pin.id));
+    if (IS_IN_FORMA) await removeElevationPin(pin).catch(() => {});
+  }, []);
+
+  const handleClearPins = useCallback(async () => {
+    const toRemove = elevPins;
+    setElevPins([]);
+    if (IS_IN_FORMA) await clearAllElevationPins(toRemove).catch(() => {});
+  }, [elevPins]);
+
   return (
     <div style={{fontFamily:"'Inter',system-ui,sans-serif",background:"#fff",width:"100%",boxSizing:"border-box"}}>
       <style>{`@keyframes spin{to{transform:rotate(360deg)}} *{box-sizing:border-box}`}</style>
@@ -148,7 +181,7 @@ export default function OverlaysApp() {
       {/* Header */}
       <div style={{padding:"12px 14px 10px",borderBottom:`1px solid ${T.border}`}}>
         <div style={{fontSize:14,fontWeight:600,color:T.tx1}}>Site Overlays</div>
-        <div style={{fontSize:11,color:T.tx3,marginTop:2}}>Slope · Power infrastructure</div>
+        <div style={{fontSize:11,color:T.tx3,marginTop:2}}>Slope · Elevation · Power infrastructure</div>
       </div>
 
       <div style={{padding:"10px 14px",display:"flex",flexDirection:"column",gap:10}}>
@@ -172,6 +205,59 @@ export default function OverlaysApp() {
             </div>
           </>
         </OverlayCard>
+
+        {/* ── Elevation Check ────────────────────────────────────────────── */}
+        <div style={{border:`1px solid ${elevPins.length?'#e67e2244':T.border}`,
+          borderRadius:8,background:"#fff",overflow:"hidden",
+          boxShadow:elevPins.length?'0 0 0 2px #e67e2218':'none',transition:"all .2s"}}>
+          <div style={{padding:"10px 12px",background:elevPins.length?'#e67e2209':'#fff'}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+              <div style={{width:8,height:8,borderRadius:"50%",background:"#e67e22",flexShrink:0}}/>
+              <span style={{flex:1,fontSize:13,fontWeight:500,color:elevPins.length?"#e67e22":T.tx1}}>
+                Spot elevation
+              </span>
+              <button onClick={handlePickElev} disabled={elevPicking}
+                style={{padding:"3px 10px",fontSize:11,fontWeight:500,
+                  background:elevPicking?T.blueLt:"#e67e22",color:elevPicking?T.blue:"#fff",
+                  border:`1px solid ${elevPicking?T.blueMid:"#c26b10"}`,
+                  borderRadius:5,cursor:elevPicking?"default":"pointer",
+                  whiteSpace:"nowrap",flexShrink:0}}>
+                {elevPicking ? "Picking…" : "Pick point"}
+              </button>
+            </div>
+            <div style={{fontSize:11,color:T.tx3,lineHeight:1.3}}>
+              {elevPicking
+                ? "Click a point on the terrain — ESC to cancel"
+                : "Click any point on the terrain to read its elevation."}
+            </div>
+          </div>
+          {elevPins.length > 0 && (
+            <div style={{padding:"0 12px 12px",background:"#e67e2205"}}>
+              <div style={{borderTop:`1px solid ${T.border}`,paddingTop:10}}>
+                {elevPins.map((pin, i) => (
+                  <div key={pin.id} style={{display:"flex",alignItems:"center",gap:6,marginBottom:5,
+                    padding:"5px 7px",borderRadius:4,background:"#fff",border:`1px solid ${T.border}`}}>
+                    <div style={{width:8,height:8,borderRadius:1,background:"#e67e22",flexShrink:0}}/>
+                    <span style={{flex:1,fontSize:11,color:T.tx1,fontWeight:500}}>
+                      Pin {i+1}: {pin.elevFt.toFixed(1)} ft
+                    </span>
+                    <span style={{fontSize:10,color:T.tx3}}>{pin.elevM.toFixed(1)} m</span>
+                    <button onClick={() => handleRemovePin(pin)}
+                      style={{fontSize:12,color:T.tx3,background:"none",border:"none",
+                        cursor:"pointer",padding:"0 2px",lineHeight:1,marginLeft:2}}>
+                      ✕
+                    </button>
+                  </div>
+                ))}
+                <button onClick={handleClearPins}
+                  style={{fontSize:10,color:T.tx3,background:"none",border:"none",
+                    cursor:"pointer",padding:0,textDecoration:"underline",display:"block",marginTop:4}}>
+                  Clear all pins
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
 
         {/* ── Power ──────────────────────────────────────────────────────── */}
         <OverlayCard title="Power infrastructure" iconColor={T.blue}
